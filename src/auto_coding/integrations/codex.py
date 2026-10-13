@@ -1,12 +1,10 @@
-"""Run one Codex implementation prompt.
-
-Windows child-process-tree cleanup must be completed before unattended live execution.
-"""
+"""Run one Codex implementation prompt."""
 
 from dataclasses import dataclass
 from pathlib import Path
-import subprocess
 import time
+
+from auto_coding.integrations.windows_process import run_windows_process
 
 
 @dataclass(frozen=True)
@@ -15,6 +13,7 @@ class ImplementationOutcome:
     elapsed_seconds: float
     timed_out: bool
     succeeded: bool
+    cleanup_result: str = "not_needed"
 
 
 def run_implementation(
@@ -33,21 +32,16 @@ def run_implementation(
         "-",
     ]
     started = time.monotonic()
-    try:
-        result = subprocess.run(
-            command,
-            input=prompt.encode("utf-8"),
-            cwd=repository_directory,
-            timeout=timeout_seconds,
-            shell=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        return ImplementationOutcome(None, time.monotonic() - started, True, False)
-    except OSError:
-        return ImplementationOutcome(None, time.monotonic() - started, False, False)
+    result = run_windows_process(
+        command,
+        input_bytes=prompt.encode("utf-8"),
+        cwd=repository_directory,
+        timeout_seconds=timeout_seconds,
+    )
     return ImplementationOutcome(
-        result.returncode, time.monotonic() - started, False, result.returncode == 0
+        result.exit_status,
+        time.monotonic() - started,
+        result.timed_out,
+        result.exit_status == 0 and not result.timed_out,
+        result.cleanup_result,
     )
