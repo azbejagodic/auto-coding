@@ -39,7 +39,8 @@ class ReviewTests(unittest.TestCase):
         value.update(changes)
         return value
 
-    def run_with_verdict(self, verdict=None, *, raw=None, process=None, events=None):
+    def run_with_verdict(self, verdict=None, *, raw=None, process=None, events=None,
+                         session_id=None):
         if process is None:
             process = WindowsProcessResult(0, False, "not_needed")
 
@@ -60,7 +61,7 @@ class ReviewTests(unittest.TestCase):
         with patch("auto_coding.review.run_windows_process", side_effect=execute) as runner:
             result = run_review(
                 self.prompt, "gpt-6-sol", "medium", self.repository.name, 12,
-                self.criteria,
+                self.criteria, session_id=session_id,
             )
         self.assertEqual(runner.call_count, 1)
         self.assertTrue(all(not path.exists() for path in self.artifact_paths))
@@ -119,6 +120,95 @@ class ReviewTests(unittest.TestCase):
                 self.assertFalse(result.approved)
                 self.assertEqual(result.verdict.decision, decision)
                 self.assertEqual(result.session_id, self.SESSION_ID)
+
+    def test_resume_uses_exact_read_only_command_and_verdict_gate(self):
+        result = self.run_with_verdict(self.verdict(), session_id=self.SESSION_ID)
+        self.assertTrue(result.approved)
+        self.assertEqual(result.session_id, self.SESSION_ID)
+        command, options = self.calls[-1]
+        schema_path, verdict_path = self.artifact_paths[-2:]
+        self.assertEqual(command, [
+            "codex", "--ask-for-approval", "never", "exec", "resume",
+            "--model", "gpt-6-sol", "-c", "model_reasoning_effort=medium",
+            "-c", 'sandbox_mode="read-only"',
+            "--output-schema", str(schema_path),
+            "--output-last-message", str(verdict_path),
+            "--json", self.SESSION_ID, "-",
+        ])
+        self.assertNotIn("--last", command)
+        self.assertNotIn("fork", command)
+        self.assertEqual(options["input_bytes"], self.prompt.encode("utf-8"))
+        self.assertEqual(options["cwd"], self.repository.name)
+        self.assertEqual(options["timeout_seconds"], 12)
+        self.assertNotIn(self.prompt, repr(result))
+
+    def test_resumed_rejected_uncertain_and_incomplete_approvals(self):
+        for decision in ("REJECTED", "UNCERTAIN"):
+            with self.subTest(decision=decision):
+                result = self.run_with_verdict(self.verdict(decision=decision),
+                                               session_id=self.SESSION_ID)
+                self.assertFalse(result.approved)
+                self.assertEqual(result.verdict.decision, decision)
+                self.assertEqual(result.session_id, self.SESSION_ID)
+        for verdict, code in (
+            (self.verdict(blocking_issues=["issue"]), "BLOCKING_ISSUES"),
+            (self.verdict(checked_requirements=[self.criteria[0]]),
+             "CRITERIA_NOT_COVERED"),
+        ):
+            with self.subTest(code=code):
+                result = self.run_with_verdict(verdict, session_id=self.SESSION_ID)
+                self.assertFalse(result.approved)
+                self.assertEqual(result.error_code, code)
+                self.assertEqual(result.session_id, self.SESSION_ID)
+        invalid = self.run_with_verdict(self.verdict(extra="unexpected"),
+                                        session_id=self.SESSION_ID)
+        self.assertFalse(invalid.approved)
+        self.assertEqual(invalid.error_code, "VERDICT_INVALID")
+
+    def test_invalid_resume_id_stops_before_execution(self):
+        invalid = ("", "not-a-uuid", "00000000-0000-0000-0000-000000000000",
+                   "a26947d0111144448888849398fad344", 42)
+        with patch("auto_coding.review.run_windows_process") as runner:
+            for value in invalid:
+                with self.subTest(value=value):
+                    result = run_review(self.prompt, "gpt-6-sol", "medium",
+                                        self.repository.name, 12, self.criteria,
+                                        session_id=value)
+                    self.assertFalse(result.approved)
+                    self.assertEqual(result.error_code, "SESSION_ID_INVALID")
+                    self.assertIsNone(result.session_id)
+            runner.assert_not_called()
+
+    def test_resume_missing_or_mismatched_session_fails_closed(self):
+        other_id = "ee39e95b-2222-4444-8888-2cb53be63093"
+        for events, code in (
+            (b'{"type":"turn.completed"}\n', "SESSION_ID_MISSING"),
+            (self.events(other_id), "SESSION_ID_MISMATCH"),
+        ):
+            with self.subTest(code=code):
+                result = self.run_with_verdict(self.verdict(), events=events,
+                                               session_id=self.SESSION_ID)
+                self.assertFalse(result.approved)
+                self.assertEqual(result.error_code, code)
+                self.assertIsNone(result.session_id)
+                self.assertEqual(self.calls[-1][0][4], "resume")
+
+    def test_resume_process_failures_never_retry_or_approve(self):
+        for process, code in (
+            (WindowsProcessResult(7, False, "not_needed"), "PROCESS_FAILED"),
+            (WindowsProcessResult(None, False, "launch_failed"), "PROCESS_LAUNCH_FAILED"),
+            (WindowsProcessResult(None, True, "taskkill_completed"), "PROCESS_TIMEOUT"),
+            (WindowsProcessResult(None, True, "taskkill_failed"), "PROCESS_TIMEOUT"),
+            (WindowsProcessResult(0, False, "parent_not_reaped"),
+             "PROCESS_CLEANUP_UNCERTAIN"),
+        ):
+            with self.subTest(code=code, process=process):
+                result = self.run_with_verdict(self.verdict(), process=process,
+                                               session_id=self.SESSION_ID)
+                self.assertFalse(result.approved)
+                self.assertEqual(result.error_code, code)
+                self.assertIsNone(result.session_id)
+                self.assertEqual(self.calls[-1][0][4], "resume")
 
     def test_missing_malformed_ambiguous_and_oversized_session_evidence(self):
         other_id = "ee39e95b-2222-4444-8888-2cb53be63093"

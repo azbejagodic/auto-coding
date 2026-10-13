@@ -5,6 +5,7 @@ import json
 import math
 from pathlib import Path
 import tempfile
+import uuid
 
 from auto_coding.integrations.session_events import MAX_JSONL_BYTES, session_from_jsonl
 from auto_coding.integrations.windows_process import run_windows_process
@@ -112,9 +113,18 @@ def run_review(
     repository_directory: str | Path,
     timeout_seconds: float,
     acceptance_criteria: list[str],
+    *,
+    session_id: str | None = None,
 ) -> ReviewResult:
-    """Run a fresh reviewer and approve only a complete, valid verdict."""
+    """Run a fresh or explicitly resumed reviewer through the same verdict gate."""
     _validate_inputs(prompt, model, reasoning_effort, timeout_seconds, acceptance_criteria)
+    if session_id is not None:
+        try:
+            parsed_id = uuid.UUID(session_id) if isinstance(session_id, str) else None
+        except ValueError:
+            parsed_id = None
+        if parsed_id is None or parsed_id.int == 0 or str(parsed_id) != session_id.lower():
+            return ReviewResult(False, None, "SESSION_ID_INVALID", None, False, "not_needed")
     try:
         repository = Path(repository_directory).resolve()
         temporary_root = Path(tempfile.gettempdir()).resolve()
@@ -125,16 +135,25 @@ def run_review(
             schema_path = Path(temporary) / "verdict-schema.json"
             verdict_path = Path(temporary) / "verdict.json"
             schema_path.write_text(json.dumps(_VERDICT_SCHEMA), encoding="utf-8")
-            command = [
-                "codex", "--ask-for-approval", "never", "exec",
+            command = ["codex", "--ask-for-approval", "never", "exec"]
+            if session_id is not None:
+                command.append("resume")
+            command.extend([
                 "--model", model,
                 "-c", f"model_reasoning_effort={reasoning_effort}",
-                "--sandbox", "read-only",
+            ])
+            if session_id is not None:
+                command.extend(["-c", 'sandbox_mode="read-only"'])
+            else:
+                command.extend(["--sandbox", "read-only"])
+            command.extend([
                 "--output-schema", str(schema_path),
                 "--output-last-message", str(verdict_path),
                 "--json",
-                "-",
-            ]
+            ])
+            if session_id is not None:
+                command.append(session_id)
+            command.append("-")
             with tempfile.TemporaryFile(mode="w+b", dir=temporary) as output_file:
                 process = run_windows_process(
                     command,
@@ -157,9 +176,12 @@ def run_review(
                                         False, process.cleanup_result)
 
                 output_file.seek(0)
-                session_id, error = session_from_jsonl(output_file.read(MAX_JSONL_BYTES + 1))
+                returned_id, error = session_from_jsonl(output_file.read(MAX_JSONL_BYTES + 1))
                 if error is not None:
                     return ReviewResult(False, None, error, 0, False, "not_needed")
+                if session_id is not None and returned_id.lower() != session_id.lower():
+                    return ReviewResult(False, None, "SESSION_ID_MISMATCH", 0, False,
+                                        "not_needed")
 
             try:
                 with verdict_path.open("rb") as verdict_file:
@@ -177,15 +199,15 @@ def run_review(
             except (TypeError, ValueError):
                 return ReviewResult(False, None, "VERDICT_INVALID", 0, False, "not_needed")
             if verdict.decision != "APPROVED":
-                return ReviewResult(False, verdict, None, 0, False, "not_needed", session_id)
+                return ReviewResult(False, verdict, None, 0, False, "not_needed", returned_id)
             if verdict.blocking_issues:
                 return ReviewResult(False, verdict, "BLOCKING_ISSUES", 0, False,
-                                    "not_needed", session_id)
+                                    "not_needed", returned_id)
             if not all(
                 criterion in verdict.checked_requirements for criterion in acceptance_criteria
             ):
                 return ReviewResult(False, verdict, "CRITERIA_NOT_COVERED", 0, False,
-                                    "not_needed", session_id)
-            return ReviewResult(True, verdict, None, 0, False, "not_needed", session_id)
+                                    "not_needed", returned_id)
+            return ReviewResult(True, verdict, None, 0, False, "not_needed", returned_id)
     except OSError:
         return ReviewResult(False, None, "TEMP_IO_FAILED", None, False, "not_needed")
