@@ -6,5 +6,6 @@ dist/
 .venv/
 venv/
 data/
+runtime/
 .env
 .env.*
