@@ -19,6 +19,9 @@ _EFFORTS = {"low", "medium", "high", "xhigh"}
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 _MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*\Z")
 _SHA = re.compile(r"[0-9a-fA-F]{40}\Z")
+_WINDOWS_DEVICES = {"CON", "PRN", "AUX", "NUL"} | {
+    f"{prefix}{number}" for prefix in ("COM", "LPT") for number in range(1, 10)
+}
 
 
 def _fields(value: object, required: set[str], field: str) -> dict:
@@ -62,9 +65,15 @@ def _path(value: object, field: str) -> None:
     parts = path.split("/")
     if (
         path.startswith("/") or "\\" in path or ":" in path
-        or any(char in path for char in "*?[]{}")
+        or any(char in path for char in "*?[]{}<>\"|")
         or any(ord(char) < 32 or ord(char) == 127 for char in path)
-        or any(part in {"", ".", ".."} or part.lower() == ".git" for part in parts)
+        or any(
+            part in {"", ".", ".."}
+            or part.lower() == ".git"
+            or part.endswith((" ", "."))
+            or part.split(".", 1)[0].rstrip(" ").upper() in _WINDOWS_DEVICES
+            for part in parts
+        )
     ):
         raise PlanValidationError(f"{field} must be a normalized repository-relative path")
 
@@ -123,9 +132,10 @@ def validate_plan(data: object) -> dict:
         seen_paths: set[str] = set()
         for path in paths:
             _path(path, f"{field}.permitted_files")
-            if path in seen_paths:
+            normalized_case = path.casefold()
+            if normalized_case in seen_paths:
                 raise PlanValidationError(f"{field}.permitted_files contains a duplicate path")
-            seen_paths.add(path)
+            seen_paths.add(normalized_case)
 
         commands = task["test_commands"]
         if not isinstance(commands, list) or not commands:

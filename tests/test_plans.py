@@ -135,6 +135,40 @@ class PlanValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(PlanValidationError, "permitted_files"):
             validate_plan(plan)
 
+    def test_windows_device_names_are_rejected(self) -> None:
+        devices = ("CON", "PRN", "AUX", "NUL") + tuple(
+            f"{prefix}{number}" for prefix in ("COM", "LPT") for number in range(1, 10)
+        )
+        for device in devices:
+            for component in (device, device.lower() + ".txt", device.title() + ".log"):
+                with self.subTest(component=component):
+                    plan = make_plan()
+                    plan["tasks"][0]["permitted_files"] = [f"src/{component}"]
+                    with self.assertRaisesRegex(PlanValidationError, "permitted_files"):
+                        validate_plan(plan)
+
+    def test_windows_invalid_component_endings_and_characters(self) -> None:
+        for path in ("folder./file.py", "folder /file.py", "folder/file.",
+                     "folder/file ", "folder/a<b.py", "folder/a>b.py",
+                     'folder/a"b.py', "folder/a|b.py"):
+            with self.subTest(path=path):
+                plan = make_plan()
+                plan["tasks"][0]["permitted_files"] = [path]
+                with self.assertRaisesRegex(PlanValidationError, "permitted_files"):
+                    validate_plan(plan)
+
+    def test_case_only_duplicate_paths_are_rejected(self) -> None:
+        plan = make_plan()
+        plan["tasks"][0]["permitted_files"] = ["src/Example.py", "SRC/example.PY"]
+        with self.assertRaisesRegex(PlanValidationError, "permitted_files"):
+            validate_plan(plan)
+
+    def test_normal_windows_paths_remain_valid(self) -> None:
+        plan = make_plan()
+        paths = ["src/auto_coding/example.py", "docs/conductor.md", "ports/COM10.txt"]
+        plan["tasks"][0]["permitted_files"] = paths
+        self.assertEqual(validate_plan(plan)["tasks"][0]["permitted_files"], paths)
+
     def test_invalid_test_commands(self) -> None:
         for commands in ([], ["py"], [[]], [[""]], [[" "]], [["py", 1]]):
             with self.subTest(commands=commands):
