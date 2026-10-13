@@ -6,6 +6,7 @@ Taskkill cannot guarantee containment of descendants that already detached.
 from dataclasses import dataclass
 from pathlib import Path
 import subprocess
+from typing import BinaryIO
 
 
 @dataclass(frozen=True)
@@ -22,13 +23,14 @@ def run_windows_process(
     cwd: str | Path,
     timeout_seconds: float,
     cleanup_timeout_seconds: float = 5.0,
+    stdout_file: BinaryIO | None = None,
 ) -> WindowsProcessResult:
-    """Run once, discard output, and report timeout cleanup explicitly."""
+    """Run once, optionally redirect stdout, and report timeout cleanup."""
     try:
         process = subprocess.Popen(
             command,
             stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
+            stdout=stdout_file if stdout_file is not None else subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             cwd=cwd,
             shell=False,

@@ -14,6 +14,18 @@ from auto_coding.integrations.windows_process import run_windows_process
 
 
 class WindowsProcessTests(unittest.TestCase):
+    def test_optional_binary_stdout_redirect_preserves_default(self) -> None:
+        with tempfile.TemporaryFile(mode="w+b") as output_file:
+            with patch("auto_coding.integrations.windows_process.subprocess.Popen") as popen:
+                process = popen.return_value
+                process.returncode = 0
+                result = run_windows_process(
+                    ["tool"], input_bytes=b"literal", cwd="repo", timeout_seconds=8,
+                    stdout_file=output_file,
+                )
+            self.assertIs(popen.call_args.kwargs["stdout"], output_file)
+            self.assertEqual(result.exit_status, 0)
+
     def test_normal_completion_uses_popen_without_shell(self) -> None:
         with patch("auto_coding.integrations.windows_process.subprocess.Popen") as popen:
             process = popen.return_value
