@@ -1,16 +1,16 @@
 """Run one Codex implementation prompt."""
 
 from dataclasses import dataclass
-import json
 from pathlib import Path
 import tempfile
 import time
 import uuid
 
+from auto_coding.integrations.session_events import (
+    MAX_JSONL_BYTES as _MAX_JSONL_BYTES,
+    session_from_jsonl as _session_from_jsonl,
+)
 from auto_coding.integrations.windows_process import run_windows_process
-
-
-_MAX_JSONL_BYTES = 8 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -22,38 +22,6 @@ class ImplementationOutcome:
     cleanup_result: str = "not_needed"
     session_id: str | None = None
     error_code: str | None = None
-
-
-def _session_from_jsonl(output: bytes) -> tuple[str | None, str | None]:
-    if len(output) > _MAX_JSONL_BYTES:
-        return None, "OUTPUT_TOO_LARGE"
-
-    session_id = None
-    for line in output.splitlines():
-        try:
-            event = json.loads(line)
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            return None, "SESSION_EVIDENCE_MALFORMED"
-        if not isinstance(event, dict) or not isinstance(event.get("type"), str):
-            return None, "SESSION_EVIDENCE_MALFORMED"
-        if event["type"] != "thread.started":
-            continue
-        value = event.get("thread_id")
-        if not isinstance(value, str):
-            return None, "SESSION_ID_INVALID"
-        try:
-            parsed = uuid.UUID(value)
-        except ValueError:
-            return None, "SESSION_ID_INVALID"
-        if parsed.int == 0 or str(parsed) != value.lower():
-            return None, "SESSION_ID_INVALID"
-        if session_id is not None:
-            return None, "SESSION_ID_AMBIGUOUS"
-        session_id = value
-
-    if session_id is None:
-        return None, "SESSION_ID_MISSING"
-    return session_id, None
 
 
 def run_implementation(

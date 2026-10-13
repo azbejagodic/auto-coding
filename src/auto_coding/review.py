@@ -6,6 +6,7 @@ import math
 from pathlib import Path
 import tempfile
 
+from auto_coding.integrations.session_events import MAX_JSONL_BYTES, session_from_jsonl
 from auto_coding.integrations.windows_process import run_windows_process
 
 
@@ -44,6 +45,7 @@ class ReviewResult:
     exit_status: int | None
     timed_out: bool
     cleanup_result: str
+    session_id: str | None = None
 
 
 def _validate_inputs(
@@ -130,26 +132,34 @@ def run_review(
                 "--sandbox", "read-only",
                 "--output-schema", str(schema_path),
                 "--output-last-message", str(verdict_path),
+                "--json",
                 "-",
             ]
-            process = run_windows_process(
-                command,
-                input_bytes=prompt.encode("utf-8"),
-                cwd=repository_directory,
-                timeout_seconds=timeout_seconds,
-            )
-            if process.timed_out:
-                return ReviewResult(False, None, "PROCESS_TIMEOUT", process.exit_status, True,
-                                    process.cleanup_result)
-            if process.cleanup_result == "launch_failed":
-                return ReviewResult(False, None, "PROCESS_LAUNCH_FAILED", process.exit_status,
-                                    False, process.cleanup_result)
-            if process.cleanup_result != "not_needed":
-                return ReviewResult(False, None, "PROCESS_CLEANUP_UNCERTAIN", process.exit_status,
-                                    False, process.cleanup_result)
-            if process.exit_status != 0:
-                return ReviewResult(False, None, "PROCESS_FAILED", process.exit_status, False,
-                                    process.cleanup_result)
+            with tempfile.TemporaryFile(mode="w+b", dir=temporary) as output_file:
+                process = run_windows_process(
+                    command,
+                    input_bytes=prompt.encode("utf-8"),
+                    cwd=repository_directory,
+                    timeout_seconds=timeout_seconds,
+                    stdout_file=output_file,
+                )
+                if process.timed_out:
+                    return ReviewResult(False, None, "PROCESS_TIMEOUT", process.exit_status, True,
+                                        process.cleanup_result)
+                if process.cleanup_result == "launch_failed":
+                    return ReviewResult(False, None, "PROCESS_LAUNCH_FAILED", process.exit_status,
+                                        False, process.cleanup_result)
+                if process.cleanup_result != "not_needed":
+                    return ReviewResult(False, None, "PROCESS_CLEANUP_UNCERTAIN",
+                                        process.exit_status, False, process.cleanup_result)
+                if process.exit_status != 0:
+                    return ReviewResult(False, None, "PROCESS_FAILED", process.exit_status,
+                                        False, process.cleanup_result)
+
+                output_file.seek(0)
+                session_id, error = session_from_jsonl(output_file.read(MAX_JSONL_BYTES + 1))
+                if error is not None:
+                    return ReviewResult(False, None, error, 0, False, "not_needed")
 
             try:
                 with verdict_path.open("rb") as verdict_file:
@@ -167,14 +177,15 @@ def run_review(
             except (TypeError, ValueError):
                 return ReviewResult(False, None, "VERDICT_INVALID", 0, False, "not_needed")
             if verdict.decision != "APPROVED":
-                return ReviewResult(False, verdict, None, 0, False, "not_needed")
+                return ReviewResult(False, verdict, None, 0, False, "not_needed", session_id)
             if verdict.blocking_issues:
-                return ReviewResult(False, verdict, "BLOCKING_ISSUES", 0, False, "not_needed")
+                return ReviewResult(False, verdict, "BLOCKING_ISSUES", 0, False,
+                                    "not_needed", session_id)
             if not all(
                 criterion in verdict.checked_requirements for criterion in acceptance_criteria
             ):
                 return ReviewResult(False, verdict, "CRITERIA_NOT_COVERED", 0, False,
-                                    "not_needed")
-            return ReviewResult(True, verdict, None, 0, False, "not_needed")
+                                    "not_needed", session_id)
+            return ReviewResult(True, verdict, None, 0, False, "not_needed", session_id)
     except OSError:
         return ReviewResult(False, None, "TEMP_IO_FAILED", None, False, "not_needed")

@@ -59,6 +59,7 @@ class CodexRunnerTests(unittest.TestCase):
         bad_outputs = [
             (b'{"type":"turn.completed"}\n', "SESSION_ID_MISSING"),
             (b'{not json}\n', "SESSION_EVIDENCE_MALFORMED"),
+            (self.jsonl()[:-1], "SESSION_EVIDENCE_MALFORMED"),
             (self.jsonl("not-a-uuid"), "SESSION_ID_INVALID"),
             (self.jsonl() + self.jsonl(str(uuid.uuid4())), "SESSION_ID_AMBIGUOUS"),
             (b"x" * (8 * 1024 * 1024 + 1), "OUTPUT_TOO_LARGE"),

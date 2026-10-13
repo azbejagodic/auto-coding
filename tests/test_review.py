@@ -13,6 +13,8 @@ from auto_coding.review import run_review
 
 
 class ReviewTests(unittest.TestCase):
+    SESSION_ID = "a26947d0-1111-4444-8888-849398fad344"
+
     def setUp(self):
         self.repository = tempfile.TemporaryDirectory()
         self.addCleanup(self.repository.cleanup)
@@ -20,6 +22,11 @@ class ReviewTests(unittest.TestCase):
         self.criteria = ["First exact criterion", "Second exact criterion"]
         self.calls = []
         self.artifact_paths = []
+        self.output_files = []
+
+    def events(self, session_id=None):
+        return (json.dumps({"type": "thread.started",
+                            "thread_id": session_id or self.SESSION_ID}) + "\n").encode("utf-8")
 
     def verdict(self, **changes):
         value = {
@@ -32,15 +39,18 @@ class ReviewTests(unittest.TestCase):
         value.update(changes)
         return value
 
-    def run_with_verdict(self, verdict=None, *, raw=None, process=None):
+    def run_with_verdict(self, verdict=None, *, raw=None, process=None, events=None):
         if process is None:
             process = WindowsProcessResult(0, False, "not_needed")
 
         def execute(command, **kwargs):
             self.calls.append((command, kwargs))
+            self.output_files.append(kwargs["stdout_file"])
             schema_path = Path(command[command.index("--output-schema") + 1])
             verdict_path = Path(command[command.index("--output-last-message") + 1])
             self.artifact_paths.extend((schema_path, verdict_path))
+            if process.exit_status == 0:
+                kwargs["stdout_file"].write(self.events() if events is None else events)
             if process.exit_status == 0 and raw is not None:
                 verdict_path.write_bytes(raw)
             elif process.exit_status == 0 and verdict is not None:
@@ -54,11 +64,14 @@ class ReviewTests(unittest.TestCase):
             )
         self.assertEqual(runner.call_count, 1)
         self.assertTrue(all(not path.exists() for path in self.artifact_paths))
+        self.assertTrue(all(file.closed for file in self.output_files))
+        self.assertTrue(all(not Path(file.name).exists() for file in self.output_files))
         return result
 
     def test_approved_verdict_and_exact_fresh_command(self):
         result = self.run_with_verdict(self.verdict())
         self.assertTrue(result.approved)
+        self.assertEqual(result.session_id, self.SESSION_ID)
         self.assertEqual(result.verdict.checked_requirements, tuple(self.criteria))
         command, options = self.calls[0]
         schema_path, verdict_path = self.artifact_paths
@@ -66,19 +79,23 @@ class ReviewTests(unittest.TestCase):
             "codex", "--ask-for-approval", "never", "exec",
             "--model", "gpt-6-sol", "-c", "model_reasoning_effort=medium",
             "--sandbox", "read-only", "--output-schema", str(schema_path),
-            "--output-last-message", str(verdict_path), "-",
+            "--output-last-message", str(verdict_path), "--json", "-",
         ])
+        output_file = options.pop("stdout_file")
         self.assertEqual(options, {
             "input_bytes": self.prompt.encode("utf-8"),
             "cwd": self.repository.name,
             "timeout_seconds": 12,
         })
+        self.assertIn(output_file, self.output_files)
+        self.assertFalse(Path(self.repository.name) in Path(output_file.name).resolve().parents)
         self.assertNotIn("resume", command)
         self.assertFalse(Path(self.repository.name) in schema_path.parents)
         self.assertFalse(Path(self.repository.name) in verdict_path.parents)
 
     def test_schema_requires_exact_verdict_fields(self):
         def inspect(command, **kwargs):
+            kwargs["stdout_file"].write(self.events())
             schema = json.loads(Path(command[command.index("--output-schema") + 1]).read_text())
             self.assertFalse(schema["additionalProperties"])
             self.assertEqual(set(schema["required"]), {
@@ -101,6 +118,27 @@ class ReviewTests(unittest.TestCase):
                 result = self.run_with_verdict(self.verdict(decision=decision))
                 self.assertFalse(result.approved)
                 self.assertEqual(result.verdict.decision, decision)
+                self.assertEqual(result.session_id, self.SESSION_ID)
+
+    def test_missing_malformed_ambiguous_and_oversized_session_evidence(self):
+        other_id = "ee39e95b-2222-4444-8888-2cb53be63093"
+        cases = [
+            (b"", "SESSION_ID_MISSING"),
+            (b'{"type":"turn.completed"}\n', "SESSION_ID_MISSING"),
+            (b'{raw private model output}\n', "SESSION_EVIDENCE_MALFORMED"),
+            (self.events()[:-1], "SESSION_EVIDENCE_MALFORMED"),
+            (self.events("not-a-uuid"), "SESSION_ID_INVALID"),
+            (self.events() + self.events(other_id), "SESSION_ID_AMBIGUOUS"),
+            (b"x" * (8 * 1024 * 1024 + 1), "OUTPUT_TOO_LARGE"),
+        ]
+        for events, code in cases:
+            with self.subTest(code=code):
+                result = self.run_with_verdict(self.verdict(), events=events)
+                self.assertFalse(result.approved)
+                self.assertIsNone(result.session_id)
+                self.assertEqual(result.error_code, code)
+                self.assertNotIn(self.prompt, repr(result))
+                self.assertNotIn("raw private model output", repr(result))
 
     def test_blocking_issues_and_missing_criteria_stop_approval(self):
         blocked = self.run_with_verdict(self.verdict(blocking_issues=["issue"]))
