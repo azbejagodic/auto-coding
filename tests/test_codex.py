@@ -16,6 +16,17 @@ from auto_coding.integrations.windows_process import WindowsProcessResult
 class CodexRunnerTests(unittest.TestCase):
     SESSION_ID = "a26947d0-1111-4444-8888-849398fad344"
 
+    def report(self, **changes):
+        value = {
+            "summary": "Added a small implementation",
+            "approach": "Used the approved files",
+            "files_reported": ["src/auto_coding/example.py"],
+            "confidence": "MEDIUM",
+            "concerns": [],
+        }
+        value.update(changes)
+        return value
+
     def jsonl(self, session_id=None):
         return (json.dumps({"type": "thread.started", "thread_id": session_id or self.SESSION_ID})
                 + "\n" + json.dumps({"type": "turn.completed"}) + "\n").encode("utf-8")
@@ -24,10 +35,18 @@ class CodexRunnerTests(unittest.TestCase):
         prompt = "Implement this literal text: $HOME && `echo hi`\nž"
         workspace = Path(__file__).resolve().parents[1]
         output_files = []
+        artifacts = []
 
         def execute(command, **kwargs):
             output_files.append(kwargs["stdout_file"])
             kwargs["stdout_file"].write(self.jsonl())
+            schema_path = Path(command[command.index("--output-schema") + 1])
+            report_path = Path(command[command.index("--output-last-message") + 1])
+            artifacts.extend((schema_path, report_path))
+            schema = json.loads(schema_path.read_text(encoding="utf-8"))
+            self.assertEqual(set(schema["required"]), set(self.report()))
+            self.assertFalse(schema["additionalProperties"])
+            report_path.write_text(json.dumps(self.report()), encoding="utf-8")
             return WindowsProcessResult(0, False, "not_needed")
 
         with patch("auto_coding.integrations.codex.run_windows_process") as run:
@@ -36,10 +55,13 @@ class CodexRunnerTests(unittest.TestCase):
 
         run.assert_called_once()
         args, kwargs = run.call_args
+        schema_path, report_path = artifacts
         self.assertEqual(args[0], [
             "codex", "--ask-for-approval", "never", "exec", "--model", "gpt-6-sol",
             "-c", "model_reasoning_effort=medium",
-            "--sandbox", "workspace-write", "--json", "-",
+            "--sandbox", "workspace-write", "--json",
+            "--output-schema", str(schema_path),
+            "--output-last-message", str(report_path), "-",
         ])
         self.assertEqual(kwargs["input_bytes"], prompt.encode("utf-8"))
         self.assertEqual(kwargs["cwd"], workspace)
@@ -47,7 +69,10 @@ class CodexRunnerTests(unittest.TestCase):
         self.assertTrue(output_files[0].closed)
         self.assertFalse(Path(output_files[0].name).exists())
         self.assertFalse(Path(workspace) in Path(output_files[0].name).resolve().parents)
+        self.assertTrue(all(not path.exists() for path in artifacts))
         self.assertTrue(outcome.succeeded)
+        self.assertEqual(outcome.report.summary, self.report()["summary"])
+        self.assertEqual(outcome.report.files_reported, tuple(self.report()["files_reported"]))
         self.assertEqual(outcome.session_id, self.SESSION_ID)
         self.assertIsNone(outcome.error_code)
         self.assertEqual(outcome.exit_status, 0)
@@ -80,12 +105,80 @@ class CodexRunnerTests(unittest.TestCase):
                 self.assertNotIn("private prompt", repr(outcome))
                 self.assertNotIn("thread.started", repr(outcome))
 
-    def test_resume_uses_exact_session_model_effort_workspace_and_prompt(self) -> None:
-        prompt = "Continue literally: $HOME && private model output"
-        workspace = Path(__file__).resolve().parents[1]
+    def test_missing_malformed_invalid_and_oversized_reports_fail(self) -> None:
+        invalid_reports = [
+            (None, "REPORT_MISSING"),
+            (b"{private model output", "REPORT_INVALID_JSON"),
+            (b'{"summary":"a","summary":"b"}', "REPORT_INVALID_JSON"),
+            (json.dumps({key: value for key, value in self.report().items()
+                         if key != "approach"}).encode(), "REPORT_INVALID"),
+            (json.dumps(self.report(extra="unexpected")).encode(), "REPORT_INVALID"),
+            (json.dumps(self.report(summary=42)).encode(), "REPORT_INVALID"),
+            (json.dumps(self.report(confidence="CERTAIN")).encode(), "REPORT_INVALID"),
+            (json.dumps(self.report(summary=" ")).encode(), "REPORT_INVALID"),
+            (json.dumps(self.report(approach="a" * 2001)).encode(), "REPORT_INVALID"),
+            (json.dumps(self.report(files_reported=[1])).encode(), "REPORT_INVALID"),
+            (json.dumps(self.report(files_reported=["x" * 513])).encode(), "REPORT_INVALID"),
+            (json.dumps(self.report(concerns=["x" * 2001])).encode(), "REPORT_INVALID"),
+            (b"x" * (64 * 1024 + 1), "REPORT_TOO_LARGE"),
+        ]
+        for raw, code in invalid_reports:
+            with self.subTest(code=code, size=None if raw is None else len(raw)):
+                artifacts = []
+
+                def execute(command, **kwargs):
+                    kwargs["stdout_file"].write(self.jsonl())
+                    artifacts.extend((
+                        Path(command[command.index("--output-schema") + 1]),
+                        Path(command[command.index("--output-last-message") + 1]),
+                    ))
+                    if raw is not None:
+                        artifacts[-1].write_bytes(raw)
+                    return WindowsProcessResult(0, False, "not_needed")
+
+                with patch("auto_coding.integrations.codex.run_windows_process",
+                           side_effect=execute) as run:
+                    outcome = run_implementation("private prompt", "gpt-6-sol", "low", ".", 5)
+                run.assert_called_once()
+                self.assertFalse(outcome.succeeded)
+                self.assertEqual(outcome.session_id, self.SESSION_ID)
+                self.assertIsNone(outcome.report)
+                self.assertEqual(outcome.error_code, code)
+                self.assertTrue(all(not path.exists() for path in artifacts))
+                self.assertNotIn("private prompt", repr(outcome))
+                self.assertNotIn("private model output", repr(outcome))
+
+    def test_report_text_is_unverified_and_hidden_from_outcome_repr(self) -> None:
+        report = self.report(summary="private model output", files_reported=["claimed.py"])
 
         def execute(command, **kwargs):
             kwargs["stdout_file"].write(self.jsonl())
+            Path(command[command.index("--output-last-message") + 1]).write_text(
+                json.dumps(report), encoding="utf-8",
+            )
+            return WindowsProcessResult(0, False, "not_needed")
+
+        with patch("auto_coding.integrations.codex.run_windows_process",
+                   side_effect=execute) as run:
+            outcome = run_implementation("private prompt", "gpt-6-sol", "medium", ".", 5)
+        run.assert_called_once()
+        self.assertTrue(outcome.succeeded)
+        self.assertEqual(outcome.report.summary, "private model output")
+        self.assertEqual(outcome.report.files_reported, ("claimed.py",))
+        self.assertNotIn("private model output", repr(outcome))
+        self.assertNotIn("private model output", repr(outcome.report))
+
+    def test_resume_uses_exact_session_model_effort_workspace_and_prompt(self) -> None:
+        prompt = "Continue literally: $HOME && private model output"
+        workspace = Path(__file__).resolve().parents[1]
+        artifacts = []
+
+        def execute(command, **kwargs):
+            kwargs["stdout_file"].write(self.jsonl())
+            schema_path = Path(command[command.index("--output-schema") + 1])
+            report_path = Path(command[command.index("--output-last-message") + 1])
+            artifacts.extend((schema_path, report_path))
+            report_path.write_text(json.dumps(self.report()), encoding="utf-8")
             return WindowsProcessResult(0, False, "not_needed")
 
         with patch("auto_coding.integrations.codex.run_windows_process",
@@ -96,17 +189,22 @@ class CodexRunnerTests(unittest.TestCase):
 
         run.assert_called_once()
         args, kwargs = run.call_args
+        schema_path, report_path = artifacts
         self.assertEqual(args[0], [
             "codex", "--ask-for-approval", "never", "exec", "resume",
             "--model", "gpt-6-sol", "-c", "model_reasoning_effort=high",
-            "-c", 'sandbox_mode="workspace-write"', "--json", self.SESSION_ID, "-",
+            "-c", 'sandbox_mode="workspace-write"', "--json",
+            "--output-schema", str(schema_path),
+            "--output-last-message", str(report_path), self.SESSION_ID, "-",
         ])
         self.assertEqual(kwargs["input_bytes"], prompt.encode("utf-8"))
         self.assertEqual(kwargs["cwd"], workspace)
         self.assertEqual(kwargs["timeout_seconds"], 21)
         self.assertTrue(outcome.succeeded)
         self.assertEqual(outcome.session_id, self.SESSION_ID)
+        self.assertEqual(outcome.report.confidence, "MEDIUM")
         self.assertIsNone(outcome.error_code)
+        self.assertTrue(all(not path.exists() for path in artifacts))
         self.assertNotIn(prompt, repr(outcome))
         self.assertNotIn("private model output", repr(outcome))
 
