@@ -26,11 +26,10 @@ def run_implementation(
 ) -> ImplementationOutcome:
     """Run a fresh non-interactive Codex process without retaining its output."""
     command = [
-        "codex", "exec",
+        "codex", "--ask-for-approval", "never", "exec",
         "--model", model,
         "-c", f"model_reasoning_effort={reasoning_effort}",
         "--sandbox", "workspace-write",
-        "--ask-for-approval", "never",
         "-",
     ]
     started = time.monotonic()

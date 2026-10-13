@@ -21,9 +21,9 @@ class CodexRunnerTests(unittest.TestCase):
 
         run.assert_called_once_with(
             [
-                "codex", "exec", "--model", "gpt-6-sol",
+                "codex", "--ask-for-approval", "never", "exec", "--model", "gpt-6-sol",
                 "-c", "model_reasoning_effort=medium",
-                "--sandbox", "workspace-write", "--ask-for-approval", "never", "-",
+                "--sandbox", "workspace-write", "-",
             ],
             input=prompt.encode("utf-8"),
             cwd=workspace,
