@@ -79,6 +79,89 @@ class CodexRunnerTests(unittest.TestCase):
                 self.assertNotIn("private prompt", repr(outcome))
                 self.assertNotIn("thread.started", repr(outcome))
 
+    def test_resume_uses_exact_session_model_effort_workspace_and_prompt(self) -> None:
+        prompt = "Continue literally: $HOME && private model output"
+        workspace = Path(__file__).resolve().parents[1]
+
+        def execute(command, **kwargs):
+            kwargs["stdout_file"].write(self.jsonl())
+            return WindowsProcessResult(0, False, "not_needed")
+
+        with patch("auto_coding.integrations.codex.run_windows_process",
+                   side_effect=execute) as run:
+            outcome = run_implementation(
+                prompt, "gpt-6-sol", "high", workspace, 21, session_id=self.SESSION_ID,
+            )
+
+        run.assert_called_once()
+        args, kwargs = run.call_args
+        self.assertEqual(args[0], [
+            "codex", "--ask-for-approval", "never", "exec", "resume",
+            "--model", "gpt-6-sol", "-c", "model_reasoning_effort=high",
+            "-c", 'sandbox_mode="workspace-write"', "--json", self.SESSION_ID, "-",
+        ])
+        self.assertEqual(kwargs["input_bytes"], prompt.encode("utf-8"))
+        self.assertEqual(kwargs["cwd"], workspace)
+        self.assertEqual(kwargs["timeout_seconds"], 21)
+        self.assertTrue(outcome.succeeded)
+        self.assertEqual(outcome.session_id, self.SESSION_ID)
+        self.assertIsNone(outcome.error_code)
+        self.assertNotIn(prompt, repr(outcome))
+        self.assertNotIn("private model output", repr(outcome))
+
+    def test_invalid_resume_id_is_rejected_before_process_launch(self) -> None:
+        invalid = ("", "not-a-uuid", "00000000-0000-0000-0000-000000000000",
+                   "a26947d0111144448888849398fad344", 42)
+        with patch("auto_coding.integrations.codex.run_windows_process") as run:
+            for value in invalid:
+                with self.subTest(value=value):
+                    outcome = run_implementation("private", "gpt-6-sol", "medium", ".", 5,
+                                                 session_id=value)
+                    self.assertFalse(outcome.succeeded)
+                    self.assertIsNone(outcome.session_id)
+                    self.assertEqual(outcome.error_code, "SESSION_ID_INVALID")
+            run.assert_not_called()
+
+    def test_resume_missing_or_different_returned_id_fails_closed(self) -> None:
+        other_id = "ee39e95b-2222-4444-8888-2cb53be63093"
+        for output, error in (
+            (b'{"type":"turn.completed"}\n', "SESSION_ID_MISSING"),
+            (self.jsonl(other_id), "SESSION_ID_MISMATCH"),
+        ):
+            with self.subTest(error=error):
+                def execute(command, **kwargs):
+                    kwargs["stdout_file"].write(output)
+                    return WindowsProcessResult(0, False, "not_needed")
+
+                with patch("auto_coding.integrations.codex.run_windows_process",
+                           side_effect=execute) as run:
+                    outcome = run_implementation("private", "gpt-6-sol", "medium", ".", 5,
+                                                 session_id=self.SESSION_ID)
+                run.assert_called_once()
+                self.assertFalse(outcome.succeeded)
+                self.assertIsNone(outcome.session_id)
+                self.assertEqual(outcome.error_code, error)
+
+    def test_resume_process_failures_do_not_retry_or_fallback(self) -> None:
+        cases = [
+            (WindowsProcessResult(7, False, "not_needed"), "PROCESS_FAILED"),
+            (WindowsProcessResult(None, True, "taskkill_completed"), "PROCESS_TIMEOUT"),
+            (WindowsProcessResult(None, True, "taskkill_failed"), "PROCESS_TIMEOUT"),
+            (WindowsProcessResult(0, False, "parent_not_reaped"),
+             "PROCESS_CLEANUP_UNCERTAIN"),
+        ]
+        for process, error in cases:
+            with self.subTest(error=error, process=process):
+                with patch("auto_coding.integrations.codex.run_windows_process",
+                           return_value=process) as run:
+                    outcome = run_implementation("private", "gpt-6-sol", "medium", ".", 5,
+                                                 session_id=self.SESSION_ID)
+                run.assert_called_once()
+                self.assertEqual(run.call_args.args[0][4], "resume")
+                self.assertFalse(outcome.succeeded)
+                self.assertEqual(outcome.error_code, error)
+                self.assertIsNone(outcome.session_id)
+
     def test_nonzero_exit_is_failure_without_retry_or_output(self) -> None:
         prompt = "private prompt"
         with patch("auto_coding.integrations.codex.run_windows_process") as run:

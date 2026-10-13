@@ -62,17 +62,34 @@ def run_implementation(
     reasoning_effort: str,
     repository_directory: str | Path,
     timeout_seconds: float,
+    *,
+    session_id: str | None = None,
 ) -> ImplementationOutcome:
-    """Run a fresh Codex process and extract its session ID from JSONL."""
-    command = [
-        "codex", "--ask-for-approval", "never", "exec",
-        "--model", model,
-        "-c", f"model_reasoning_effort={reasoning_effort}",
-        "--sandbox", "workspace-write",
-        "--json",
-        "-",
-    ]
+    """Run a fresh or explicitly identified Codex session and verify its ID."""
     started = time.monotonic()
+    if session_id is not None:
+        try:
+            parsed_id = uuid.UUID(session_id) if isinstance(session_id, str) else None
+        except ValueError:
+            parsed_id = None
+        if parsed_id is None or parsed_id.int == 0 or str(parsed_id) != session_id.lower():
+            return ImplementationOutcome(None, time.monotonic() - started, False, False,
+                                         error_code="SESSION_ID_INVALID")
+        command = [
+            "codex", "--ask-for-approval", "never", "exec", "resume",
+            "--model", model,
+            "-c", f"model_reasoning_effort={reasoning_effort}",
+            "-c", 'sandbox_mode="workspace-write"',
+            "--json", session_id, "-",
+        ]
+    else:
+        command = [
+            "codex", "--ask-for-approval", "never", "exec",
+            "--model", model,
+            "-c", f"model_reasoning_effort={reasoning_effort}",
+            "--sandbox", "workspace-write",
+            "--json", "-",
+        ]
     try:
         repository = Path(repository_directory).resolve()
         temporary_root = Path(tempfile.gettempdir()).resolve()
@@ -103,10 +120,14 @@ def run_implementation(
                                              error_code=error)
 
             output_file.seek(0)
-            session_id, error = _session_from_jsonl(output_file.read(_MAX_JSONL_BYTES + 1))
+            returned_id, error = _session_from_jsonl(output_file.read(_MAX_JSONL_BYTES + 1))
+            if error is None and session_id is not None and returned_id.lower() != session_id.lower():
+                return ImplementationOutcome(result.exit_status, time.monotonic() - started,
+                                             False, False, result.cleanup_result,
+                                             error_code="SESSION_ID_MISMATCH")
             return ImplementationOutcome(result.exit_status, time.monotonic() - started,
                                          False, error is None, result.cleanup_result,
-                                         session_id, error)
+                                         returned_id, error)
     except OSError:
         return ImplementationOutcome(None, time.monotonic() - started, False, False,
                                      error_code="OUTPUT_UNAVAILABLE")
