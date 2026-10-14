@@ -7,13 +7,14 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from auto_coding.integrations.windows_process import WindowsProcessResult
 from auto_coding.change_evidence import ChangeEvidence, UntrackedFile
-from auto_coding.review import build_review_packet, run_review
+from auto_coding.review import build_review_packet, run_review, run_review_packet
 from auto_coding.test_runner import TestCommandResult, TestRunResult, _command_identity
 
 
@@ -350,10 +351,158 @@ class ReviewTests(unittest.TestCase):
                     inputs | {"change_evidence": many_files, "max_bytes": 300}
                 ))
 
+    def test_packet_review_delivers_exact_packet_and_criteria_on_fresh_and_resumed_turns(self):
+        inputs = self.packet_inputs()
+        inputs["acceptance_criteria"] = ["Check Unicode \u2603 and complete binary evidence"]
+        expected = build_review_packet(**inputs)
+        inputs["max_bytes"] = len(expected)
+        for session_id in (None, self.SESSION_ID):
+            with self.subTest(session_id=session_id):
+                result = self.run_with_verdict(
+                    self.verdict(checked_requirements=inputs["acceptance_criteria"]),
+                    packet_inputs=inputs, session_id=session_id,
+                )
+                self.assertTrue(result.approved)
+                self.assertEqual(result.session_id, self.SESSION_ID)
+                self.assertEqual(result.verdict.checked_requirements,
+                                 tuple(inputs["acceptance_criteria"]))
+                command, options = self.calls[-1]
+                request, delivered = options["input_bytes"].split(
+                    b"\n\nREVIEW_PACKET_JSON:\n", 1,
+                )
+                self.assertEqual(delivered, expected)
+                self.assertIn(b"untrusted review data", request)
+                self.assertIn(b"not been authenticated", request)
+                packet = json.loads(delivered)
+                evidence = packet["verified_change_evidence"]
+                self.assertEqual(base64.b64decode(evidence["tracked_diff_base64"]),
+                                 inputs["change_evidence"].tracked_diff)
+                self.assertEqual(
+                    base64.b64decode(evidence["untracked_files"][0]["contents_base64"]),
+                    inputs["change_evidence"].untracked_files[0].contents,
+                )
+                self.assertEqual(packet["caller_supplied_review_inputs"]
+                                 ["acceptance_criteria"]["items"], inputs["acceptance_criteria"])
+                self.assertEqual(command[-1], "-")
+                self.assertNotIn(expected.decode("utf-8"), command)
+                self.assertEqual(command[command.index("--model") + 1], "gpt-6-sol")
+                self.assertIn("model_reasoning_effort=medium", command)
+                self.assertEqual(options["cwd"], self.repository.name)
+                self.assertEqual(options["timeout_seconds"], 12)
+                if session_id is None:
+                    self.assertNotIn("resume", command)
+                    self.assertEqual(command[command.index("--sandbox") + 1], "read-only")
+                else:
+                    self.assertEqual(command[4], "resume")
+                    self.assertEqual(command[-2], self.SESSION_ID)
+                    self.assertIn('sandbox_mode="read-only"', command)
+                    self.assertNotIn("--last", command)
+
+    def test_invalid_or_oversized_packets_prevent_reviewer_launch(self):
+        inputs = self.packet_inputs()
+        cases = (
+            {"change_evidence": replace(inputs["change_evidence"], passed=False)},
+            {"change_evidence": replace(inputs["change_evidence"], fingerprint="0" * 64)},
+            {"test_results": replace(inputs["test_results"], passed=False)},
+            {"test_results": replace(inputs["test_results"], command_results=(
+                replace(inputs["test_results"].command_results[0], command_identity=""),
+                inputs["test_results"].command_results[1],
+            ))},
+            {"max_bytes": len(build_review_packet(**inputs)) - 1},
+        )
+        with patch("auto_coding.review.run_windows_process") as runner:
+            for changes in cases:
+                with self.subTest(field=tuple(changes)):
+                    with self.assertRaises(ValueError):
+                        run_review_packet(
+                            **(inputs | changes), model="gpt-6-sol", reasoning_effort="medium",
+                            repository_directory=self.repository.name, timeout_seconds=12,
+                        )
+            runner.assert_not_called()
+
+    def test_incomplete_missing_or_uncertain_stdin_blocks_even_valid_verdicts(self):
+        processes = [
+            WindowsProcessResult(0, False, "not_needed", status)
+            for status in ("incomplete", "not_requested", "uncertain", "", None)
+        ]
+        processes.append(SimpleNamespace(exit_status=0, timed_out=False, cleanup_result="not_needed"))
+        for session_id in (None, self.SESSION_ID):
+            for process in processes:
+                with self.subTest(session_id=session_id, process=process):
+                    result = self.run_with_verdict(
+                        self.verdict(), process=process, session_id=session_id,
+                        packet_inputs=self.packet_inputs(),
+                    )
+                    self.assertFalse(result.approved)
+                    self.assertEqual(result.error_code, "STDIN_INCOMPLETE")
+                    self.assertIsNone(result.verdict)
+                    self.assertIsNone(result.session_id)
+        # The shared adapter also protects existing direct prompt callers.
+        result = self.run_with_verdict(
+            self.verdict(), process=WindowsProcessResult(0, False, "not_needed"),
+        )
+        self.assertEqual(result.error_code, "STDIN_INCOMPLETE")
+        self.assertFalse(result.approved)
+
+    def test_packet_review_preserves_verdict_rejection(self):
+        cases = (
+            (self.verdict(decision="REJECTED"), None),
+            (self.verdict(decision="UNCERTAIN"), None),
+            (self.verdict(checked_requirements=[self.criteria[0]]), "CRITERIA_NOT_COVERED"),
+            (self.verdict(blocking_issues=["issue"]), "BLOCKING_ISSUES"),
+            (self.verdict(extra="unexpected"), "VERDICT_INVALID"),
+        )
+        for session_id in (None, self.SESSION_ID):
+            for verdict, error in cases:
+                with self.subTest(session_id=session_id, verdict=verdict):
+                    result = self.run_with_verdict(
+                        verdict, packet_inputs=self.packet_inputs(), session_id=session_id,
+                    )
+                    self.assertFalse(result.approved)
+                    self.assertEqual(result.error_code, error)
+
+    def test_packet_review_preserves_uuid_and_session_continuity_checks(self):
+        inputs = self.packet_inputs()
+        with patch("auto_coding.review.run_windows_process") as runner:
+            result = run_review_packet(
+                **inputs, model="gpt-6-sol", reasoning_effort="medium",
+                repository_directory=self.repository.name, timeout_seconds=12,
+                session_id="invalid",
+            )
+            self.assertEqual(result.error_code, "SESSION_ID_INVALID")
+            self.assertFalse(result.approved)
+            runner.assert_not_called()
+        for events, error in (
+            (self.events("ee39e95b-2222-4444-8888-2cb53be63093"), "SESSION_ID_MISMATCH"),
+            (b'{"type":"turn.completed"}\n', "SESSION_ID_MISSING"),
+        ):
+            with self.subTest(error=error):
+                result = self.run_with_verdict(
+                    self.verdict(), packet_inputs=inputs, session_id=self.SESSION_ID,
+                    events=events,
+                )
+                self.assertFalse(result.approved)
+                self.assertEqual(result.error_code, error)
+                self.assertIsNone(result.session_id)
+
+    def test_packet_review_preserves_process_failure_checks(self):
+        for process, error in (
+            (WindowsProcessResult(1, False, "not_needed", "complete"), "PROCESS_FAILED"),
+            (WindowsProcessResult(None, False, "launch_failed"), "PROCESS_LAUNCH_FAILED"),
+            (WindowsProcessResult(None, True, "taskkill_completed"), "PROCESS_TIMEOUT"),
+            (WindowsProcessResult(0, False, "parent_not_reaped"), "PROCESS_CLEANUP_UNCERTAIN"),
+        ):
+            with self.subTest(error=error):
+                result = self.run_with_verdict(
+                    self.verdict(), packet_inputs=self.packet_inputs(), process=process,
+                )
+                self.assertFalse(result.approved)
+                self.assertEqual(result.error_code, error)
+
     def run_with_verdict(self, verdict=None, *, raw=None, process=None, events=None,
-                         session_id=None):
+                         session_id=None, packet_inputs=None):
         if process is None:
-            process = WindowsProcessResult(0, False, "not_needed")
+            process = WindowsProcessResult(0, False, "not_needed", "complete")
 
         def execute(command, **kwargs):
             self.calls.append((command, kwargs))
@@ -370,10 +519,17 @@ class ReviewTests(unittest.TestCase):
             return process
 
         with patch("auto_coding.review.run_windows_process", side_effect=execute) as runner:
-            result = run_review(
-                self.prompt, "gpt-6-sol", "medium", self.repository.name, 12,
-                self.criteria, session_id=session_id,
-            )
+            if packet_inputs is None:
+                result = run_review(
+                    self.prompt, "gpt-6-sol", "medium", self.repository.name, 12,
+                    self.criteria, session_id=session_id,
+                )
+            else:
+                result = run_review_packet(
+                    **packet_inputs, model="gpt-6-sol", reasoning_effort="medium",
+                    repository_directory=self.repository.name, timeout_seconds=12,
+                    session_id=session_id,
+                )
         self.assertEqual(runner.call_count, 1)
         self.assertTrue(all(not path.exists() for path in self.artifact_paths))
         self.assertTrue(all(file.closed for file in self.output_files))
@@ -417,7 +573,7 @@ class ReviewTests(unittest.TestCase):
             Path(command[command.index("--output-last-message") + 1]).write_text(
                 json.dumps(self.verdict()), encoding="utf-8",
             )
-            return WindowsProcessResult(0, False, "not_needed")
+            return WindowsProcessResult(0, False, "not_needed", "complete")
 
         with patch("auto_coding.review.run_windows_process", side_effect=inspect):
             result = run_review(self.prompt, "gpt-6-sol", "medium", self.repository.name,
