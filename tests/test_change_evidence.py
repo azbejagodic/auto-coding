@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from auto_coding import change_evidence
 from auto_coding.change_evidence import collect_change_evidence
 
 
@@ -115,6 +116,150 @@ class ChangeEvidenceTests(unittest.TestCase):
         self.assertEqual(oversized.error_code, "EVIDENCE_TOO_LARGE")
         self.assertEqual(self.collect(["new.bin"], 0).error_code, "INVALID_MAX_BYTES")
         self.assertEqual(self.collect(["new.bin"], True).error_code, "INVALID_MAX_BYTES")
+
+    def test_oversized_raw_tracked_diff_is_rejected(self):
+        (self.repository / "tracked.txt").write_bytes(b"changed\n")
+        result = self.collect(["tracked.txt"], 16)
+        self.assertFalse(result.passed)
+        self.assertEqual(result.error_code, "EVIDENCE_TOO_LARGE")
+
+    def test_oversized_untracked_path_listing_is_rejected(self):
+        (self.repository / "untracked.txt").write_bytes(b"x")
+        result = self.collect(["untracked.txt"], 8)
+        self.assertFalse(result.passed)
+        self.assertEqual(result.error_code, "EVIDENCE_TOO_LARGE")
+
+    def test_oversized_full_tracked_diff_is_rejected(self):
+        (self.repository / "tracked.txt").write_bytes(b"x" * 1000)
+        result = self.collect(["tracked.txt"], 256)
+        self.assertFalse(result.passed)
+        self.assertEqual(result.error_code, "EVIDENCE_TOO_LARGE")
+
+    def test_git_temporary_files_use_external_directory_when_system_temp_is_in_repo(self):
+        in_repository_temp = self.repository / "configured-temp"
+        in_repository_temp.mkdir()
+        (self.repository / "tracked.txt").write_bytes(b"changed\n")
+        original_temporary_file = tempfile.TemporaryFile
+        used_directories = []
+
+        def record_temporary_file(*args, **kwargs):
+            used_directories.append(Path(kwargs["dir"]).resolve(strict=True))
+            return original_temporary_file(*args, **kwargs)
+
+        with patch("auto_coding.change_evidence.tempfile.gettempdir",
+                   return_value=str(in_repository_temp)), \
+             patch("auto_coding.change_evidence.tempfile.TemporaryFile",
+                   side_effect=record_temporary_file):
+            result = self.collect(["tracked.txt"])
+
+        self.assertTrue(result.passed, result.error_code)
+        self.assertEqual(len(used_directories), 3)
+        self.assertTrue(all(not directory.is_relative_to(self.repository)
+                            for directory in used_directories))
+
+    def test_collection_fails_closed_without_external_temp_directory(self):
+        (self.repository / "tracked.txt").write_bytes(b"changed\n")
+        with patch("auto_coding.change_evidence._external_temporary_directory",
+                   return_value=None), \
+             patch("auto_coding.change_evidence.tempfile.TemporaryFile") as temporary_file:
+            result = self.collect(["tracked.txt"])
+
+        self.assertFalse(result.passed)
+        self.assertEqual(result.error_code, "GIT_LAUNCH_FAILED")
+        temporary_file.assert_not_called()
+
+    def test_git_temporary_outputs_are_closed_after_success_failure_and_timeout(self):
+        original_temporary_file = tempfile.TemporaryFile
+        outputs = []
+
+        def tracked_temporary_file(*args, **kwargs):
+            output = original_temporary_file(*args, **kwargs)
+            outputs.append(output)
+            return output
+
+        (self.repository / "tracked.txt").write_bytes(b"changed\n")
+        with patch("auto_coding.change_evidence.tempfile.TemporaryFile",
+                   side_effect=tracked_temporary_file):
+            result = self.collect(["tracked.txt"])
+        self.assertTrue(result.passed)
+        self.assertEqual(len(outputs), 3)
+        self.assertTrue(all(output.closed for output in outputs))
+
+        outputs.clear()
+        original_run = subprocess.run
+
+        def fail_evidence_git(*args, **kwargs):
+            if args[0][1] == "status":
+                return original_run(*args, **kwargs)
+            return subprocess.CompletedProcess(args[0], 1)
+
+        with patch("auto_coding.change_evidence.tempfile.TemporaryFile",
+                   side_effect=tracked_temporary_file), \
+             patch("auto_coding.change_evidence.subprocess.run",
+                   side_effect=fail_evidence_git):
+            result = self.collect(["tracked.txt"])
+        self.assertEqual(result.error_code, "GIT_FAILED")
+        self.assertEqual(len(outputs), 1)
+        self.assertTrue(outputs[0].closed)
+
+        outputs.clear()
+
+        def timeout_evidence_git(*args, **kwargs):
+            if args[0][1] == "status":
+                return original_run(*args, **kwargs)
+            raise subprocess.TimeoutExpired(args[0], 10)
+
+        with patch("auto_coding.change_evidence.tempfile.TemporaryFile",
+                   side_effect=tracked_temporary_file), \
+             patch("auto_coding.change_evidence.subprocess.run",
+                   side_effect=timeout_evidence_git):
+            result = self.collect(["tracked.txt"])
+        self.assertEqual(result.error_code, "GIT_TIMEOUT")
+        self.assertEqual(len(outputs), 1)
+        self.assertTrue(outputs[0].closed)
+
+    def test_git_capture_uses_files_and_reads_only_limit_plus_one(self):
+        calls = []
+        read_sizes = []
+        original_temporary_file = tempfile.TemporaryFile
+
+        class SpyFile:
+            def __init__(self, wrapped):
+                self.wrapped = wrapped
+
+            def __getattr__(self, name):
+                return getattr(self.wrapped, name)
+
+            def read(self, size=-1):
+                read_sizes.append(size)
+                return self.wrapped.read(size)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                self.wrapped.close()
+                return False
+
+        def spy_temporary_file(*args, **kwargs):
+            return SpyFile(original_temporary_file(*args, **kwargs))
+
+        original_run = subprocess.run
+
+        def inspect_run(*args, **kwargs):
+            if args[0][1] != "status":
+                calls.append(kwargs["stdout"])
+            return original_run(*args, **kwargs)
+
+        (self.repository / "tracked.txt").write_bytes(b"changed\n")
+        with patch("auto_coding.change_evidence.tempfile.TemporaryFile",
+                   side_effect=spy_temporary_file), \
+             patch("auto_coding.change_evidence.subprocess.run", side_effect=inspect_run):
+            self.assertTrue(self.collect(["tracked.txt"]).passed)
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(all(hasattr(output, "read") and output != subprocess.PIPE
+                            for output in calls))
+        self.assertEqual(read_sizes, [1_000_001] * 3)
 
     def test_git_failure_stops_collection(self):
         (self.repository / "tracked.txt").write_bytes(b"changed")

@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import stat
 import subprocess
+import tempfile
 
 from auto_coding.plans import PlanValidationError, _path
 from auto_coding.scope_check import check_file_scope
@@ -30,20 +31,47 @@ class ChangeEvidence:
     error_code: str | None = None
 
 
-def _git(repository: Path, arguments: list[str]) -> tuple[bytes | None, str | None]:
+def _external_temporary_directory(repository: Path) -> Path | None:
+    candidates = []
     try:
-        result = subprocess.run(
-            ["git", *arguments], cwd=repository, stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, shell=False,
-            check=False, timeout=10,
-        )
-    except subprocess.TimeoutExpired:
-        return None, "GIT_TIMEOUT"
+        candidates.append(Path(tempfile.gettempdir()))
+    except OSError:
+        pass
+    candidates.append(repository.parent)
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError:
+            continue
+        if resolved.is_dir() and not resolved.is_relative_to(repository):
+            return resolved
+    return None
+
+
+def _git(repository: Path, arguments: list[str], max_bytes: int,
+         temporary_directory: Path
+         ) -> tuple[bytes | None, str | None]:
+    try:
+        with tempfile.TemporaryFile(mode="w+b", dir=temporary_directory) as output:
+            try:
+                result = subprocess.run(
+                    ["git", *arguments], cwd=repository, stdin=subprocess.DEVNULL,
+                    stdout=output, stderr=subprocess.DEVNULL, shell=False,
+                    check=False, timeout=10,
+                )
+            except subprocess.TimeoutExpired:
+                return None, "GIT_TIMEOUT"
+            except OSError:
+                return None, "GIT_LAUNCH_FAILED"
+            if result.returncode != 0:
+                return None, "GIT_FAILED"
+            output.seek(0)
+            captured = output.read(max_bytes + 1)
+            if len(captured) > max_bytes:
+                return None, "EVIDENCE_TOO_LARGE"
+            return captured, None
     except OSError:
         return None, "GIT_LAUNCH_FAILED"
-    if result.returncode != 0:
-        return None, "GIT_FAILED"
-    return result.stdout, None
 
 
 def _nul_paths(output: bytes) -> tuple[str, ...]:
@@ -121,12 +149,16 @@ def collect_change_evidence(
         repository = Path(repository_directory).resolve(strict=True)
         if not repository.is_dir():
             return ChangeEvidence(False, error_code="INVALID_REPOSITORY")
+        temporary_directory = _external_temporary_directory(repository)
+        if temporary_directory is None:
+            return ChangeEvidence(False, error_code="GIT_LAUNCH_FAILED")
         for path in scope.changed_files:
             _safe_location(repository, path)
     except (OSError, ValueError, PlanValidationError):
         return ChangeEvidence(False, error_code="UNSAFE_PATH")
 
-    raw, error = _git(repository, ["diff", *_DIFF_OPTIONS, "--raw", "-z", "HEAD", "--"])
+    raw, error = _git(repository, ["diff", *_DIFF_OPTIONS, "--raw", "-z", "HEAD", "--"],
+                       max_bytes, temporary_directory)
     if error:
         return ChangeEvidence(False, error_code=error)
     try:
@@ -134,7 +166,8 @@ def collect_change_evidence(
     except ValueError:
         return ChangeEvidence(False, error_code="UNSAFE_OR_MALFORMED_DIFF")
 
-    untracked_raw, error = _git(repository, ["ls-files", "--others", "--exclude-standard", "-z"])
+    untracked_raw, error = _git(repository, ["ls-files", "--others", "--exclude-standard", "-z"],
+                                max_bytes, temporary_directory)
     if error:
         return ChangeEvidence(False, error_code=error)
     try:
@@ -148,7 +181,7 @@ def collect_change_evidence(
         return ChangeEvidence(False, error_code="INCONSISTENT_EVIDENCE")
 
     diff, error = _git(repository, ["diff", *_DIFF_OPTIONS, "--binary", "--full-index",
-                                    "HEAD", "--"])
+                                    "HEAD", "--"], max_bytes, temporary_directory)
     if error:
         return ChangeEvidence(False, error_code=error)
     total = len(diff) + sum(len(path.encode("utf-8")) for path in changed)
