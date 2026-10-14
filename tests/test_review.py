@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from auto_coding.integrations.windows_process import WindowsProcessResult
 from auto_coding.change_evidence import ChangeEvidence, UntrackedFile
 from auto_coding.review import build_review_packet, run_review
-from auto_coding.test_runner import TestCommandResult, TestRunResult
+from auto_coding.test_runner import TestCommandResult, TestRunResult, _command_identity
 
 
 class ReviewTests(unittest.TestCase):
@@ -67,8 +67,10 @@ class ReviewTests(unittest.TestCase):
         commands = [["py", "-m", "unittest", "discover"], ["ruff", "check", "src"]]
         results = TestRunResult(
             True, 2,
-            (TestCommandResult(1, 0, 1.25, False, "not_needed"),
-             TestCommandResult(2, 0, 0.5, False, "not_needed")),
+            (TestCommandResult(1, 0, 1.25, False, "not_needed",
+                               command_identity=_command_identity(commands[0])),
+             TestCommandResult(2, 0, 0.5, False, "not_needed",
+                               command_identity=_command_identity(commands[1]))),
             None,
         )
         return {
@@ -103,8 +105,15 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual([item["command"] for item in test_commands],
                          inputs["approved_test_commands"])
         self.assertEqual([item["index"] for item in test_commands], [1, 2])
-        self.assertIn("does not retain executed argv",
+        self.assertEqual([item["command_identity"] for item in test_commands],
+                         [_command_identity(command)
+                          for command in inputs["approved_test_commands"]])
+        self.assertIn("matches its corresponding command",
                       caller_inputs["terminal_test_results"]["command_binding"])
+        self.assertIn("does not independently prove execution",
+                      caller_inputs["terminal_test_results"]["command_binding"])
+        self.assertIn("trusted test runner",
+                      caller_inputs["terminal_test_results"]["command_identity_provenance"])
         self.assertEqual(caller_inputs["selected_code_context"]["files"][0]["path"],
                          "src/app.py")
         self.assertEqual(base64.b64decode(
@@ -176,6 +185,45 @@ class ReviewTests(unittest.TestCase):
                 failed = replace(valid, command_results=(first, valid.command_results[1]))
                 with self.assertRaises(ValueError):
                     build_review_packet(**(inputs | {"test_results": failed}))
+
+    def test_review_packet_rejects_missing_empty_malformed_and_wrong_command_identities(self):
+        inputs = self.packet_inputs()
+        valid = inputs["test_results"]
+        for identity in (None, "", 42, b"0" * 64, "0" * 63, "0" * 65,
+                         "G" * 64, valid.command_results[0].command_identity.upper(),
+                         _command_identity(["different-tool"])):
+            with self.subTest(identity=identity):
+                first = replace(valid.command_results[0], command_identity=identity)
+                invalid = replace(valid, command_results=(first, valid.command_results[1]))
+                with self.assertRaisesRegex(ValueError, "command identity"):
+                    build_review_packet(**(inputs | {"test_results": invalid}))
+
+        legacy = TestCommandResult(1, 0, 1.25, False, "not_needed")
+        legacy_run = replace(valid, command_results=(legacy, valid.command_results[1]))
+        with self.assertRaisesRegex(ValueError, "command identity"):
+            build_review_packet(**(inputs | {"test_results": legacy_run}))
+
+    def test_review_packet_rejects_changed_executable_arguments_and_argument_order(self):
+        inputs = self.packet_inputs()
+        for changed in (
+            ["python", "-m", "unittest", "discover"],
+            ["py", "-m", "unittest", "changed"],
+            ["py", "unittest", "-m", "discover"],
+        ):
+            with self.subTest(command=changed):
+                commands = [changed, inputs["approved_test_commands"][1]]
+                with self.assertRaisesRegex(ValueError, "command identity"):
+                    build_review_packet(**(inputs | {"approved_test_commands": commands}))
+
+    def test_review_packet_rejects_swapped_successful_results_with_corrected_indices(self):
+        inputs = self.packet_inputs()
+        valid = inputs["test_results"]
+        swapped = replace(valid, command_results=(
+            replace(valid.command_results[1], index=1),
+            replace(valid.command_results[0], index=2),
+        ))
+        with self.assertRaisesRegex(ValueError, "command identity"):
+            build_review_packet(**(inputs | {"test_results": swapped}))
 
     def test_review_packet_rejects_missing_or_invalid_code_context(self):
         inputs = self.packet_inputs()
@@ -273,14 +321,15 @@ class ReviewTests(unittest.TestCase):
         contexts = CountingList(
             [(f"src/file_{index:04}.py", b"") for index in range(1000)]
         )
-        for field, value in (
-            ("acceptance_criteria", criteria),
-            ("approved_test_commands", commands),
-            ("code_context", contexts),
+        for field, value, limit in (
+            ("acceptance_criteria", criteria, 256),
+            ("approved_test_commands", commands, 256),
+            # Allow the newly budgeted identities before exercising context iteration.
+            ("code_context", contexts, 512),
         ):
             with self.subTest(field=field):
                 with self.assertRaisesRegex(ValueError, "exceeds max_bytes"):
-                    build_review_packet(**(inputs | {field: value, "max_bytes": 256}))
+                    build_review_packet(**(inputs | {field: value, "max_bytes": limit}))
                 self.assertLess(value.iterated, len(value))
 
         many_paths = tuple(f"src/file_{index:04}.py" for index in range(1000))

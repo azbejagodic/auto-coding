@@ -13,7 +13,7 @@ from auto_coding.change_evidence import ChangeEvidence, UntrackedFile
 from auto_coding.integrations.session_events import MAX_JSONL_BYTES, session_from_jsonl
 from auto_coding.integrations.windows_process import run_windows_process
 from auto_coding.plans import PlanValidationError, _path
-from auto_coding.test_runner import TestCommandResult, TestRunResult
+from auto_coding.test_runner import TestCommandResult, TestRunResult, _command_identity
 
 
 _MAX_VERDICT_BYTES = 64 * 1024
@@ -185,8 +185,9 @@ def build_review_packet(
 ) -> bytes:
     """Build deterministic, complete Codex review input without launching Codex.
 
-    Plan provenance, command-to-result identity, and code-context provenance are
-    not established here; the packet labels these caller-supplied inputs.
+    Runner-reported command identities are matched to caller-supplied commands.
+    Plan and code-context provenance are not established here; the packet
+    labels these caller-supplied inputs.
     """
     if type(max_bytes) is not int or max_bytes <= 0:
         raise ValueError("max_bytes must be a positive integer")
@@ -275,7 +276,9 @@ def build_review_packet(
             or not isinstance(results, tuple)
             or len(results) != len(approved_test_commands)):
         raise ValueError("terminal test results are missing or inconsistent")
-    for expected_index, result in enumerate(results, start=1):
+    for expected_index, (command, result) in enumerate(
+        zip(approved_test_commands, results), start=1
+    ):
         if not isinstance(result, TestCommandResult):
             raise ValueError("terminal test results are failed or inconsistent")
         try:
@@ -292,6 +295,12 @@ def build_review_packet(
                 or not valid_elapsed or result.timed_out is not False
                 or result.cleanup_result != "not_needed"):
             raise ValueError("terminal test results are failed or inconsistent")
+        identity = getattr(result, "command_identity", None)
+        if (not isinstance(identity, str) or len(identity) != 64
+                or any(character not in "0123456789abcdef" for character in identity)
+                or identity != _command_identity(command)):
+            raise ValueError("terminal test command identity is missing or inconsistent")
+        budget.add(len(',"command_identity":') + 66)  # SHA-256 hex string and quotes
 
     if not isinstance(code_context, list) or not code_context:
         raise ValueError("selected code context is missing")
@@ -339,19 +348,24 @@ def build_review_packet(
                 "items": approved_test_commands,
             },
             "terminal_test_results": {
-                "validation": "Successful ordered status metadata validated.",
+                "validation": "Successful ordered status metadata and command identities validated.",
                 "command_binding": (
-                    "Results are paired with commands by sequence index; "
-                    "TestRunResult does not retain executed argv."
+                    "Each result's command identity matches its corresponding command "
+                    "at the same sequence index. A matching hash does not independently "
+                    "prove execution or frozen-plan approval."
+                ),
+                "command_identity_provenance": (
+                    "Reported by the trusted test runner; checked against caller-supplied commands."
                 ),
                 "available_detail": (
-                    "Exit status, elapsed time, timeout and cleanup status only; "
+                    "Command identity, exit status, elapsed time, timeout and cleanup status only; "
                     "stdout, stderr and test-case counts are unavailable."
                 ),
                 "commands": [
                     {
                         "index": result.index,
                         "command": command,
+                        "command_identity": result.command_identity,
                         "exit_status": result.exit_status,
                         "elapsed_seconds": result.elapsed_seconds,
                         "timed_out": result.timed_out,
