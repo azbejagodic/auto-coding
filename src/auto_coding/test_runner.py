@@ -1,6 +1,7 @@
 """Execute approved test commands without interpreting or modifying them."""
 
 from dataclasses import dataclass
+import hashlib
 import math
 from pathlib import Path
 import time
@@ -15,6 +16,7 @@ class TestCommandResult:
     elapsed_seconds: float
     timed_out: bool
     cleanup_result: str
+    command_identity: str = ""
 
 
 @dataclass(frozen=True)
@@ -47,6 +49,18 @@ def _validate_inputs(test_commands: object, timeout_seconds: object) -> list[lis
     return test_commands
 
 
+def _command_identity(command: list[str]) -> str:
+    """Hash the executable and ordered argv with an unambiguous encoding."""
+    digest = hashlib.sha256()
+    digest.update(b"auto-coding-test-command-v1\0")
+    digest.update(len(command).to_bytes(8, "big"))
+    for argument in command:
+        encoded = argument.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return digest.hexdigest()
+
+
 def run_approved_tests(
     repository_directory: str | Path,
     test_commands: list[list[str]],
@@ -57,6 +71,7 @@ def run_approved_tests(
     results: list[TestCommandResult] = []
 
     for index, command in enumerate(commands, start=1):
+        command_identity = _command_identity(command)
         started = time.monotonic()
         process = run_windows_process(
             command,
@@ -71,6 +86,7 @@ def run_approved_tests(
             elapsed_seconds=elapsed,
             timed_out=process.timed_out,
             cleanup_result=process.cleanup_result,
+            command_identity=command_identity,
         ))
         if (
             process.exit_status != 0

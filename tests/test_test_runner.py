@@ -1,6 +1,7 @@
 """Tests for execution of approved terminal test commands."""
 
 from pathlib import Path
+import hashlib
 import sys
 import unittest
 from unittest.mock import call, patch
@@ -12,6 +13,40 @@ from auto_coding.test_runner import run_approved_tests
 
 
 class ApprovedTestRunnerTests(unittest.TestCase):
+    @staticmethod
+    def expected_command_identity(command: list[str]) -> str:
+        digest = hashlib.sha256()
+        digest.update(b"auto-coding-test-command-v1\0")
+        digest.update(len(command).to_bytes(8, "big"))
+        for argument in command:
+            encoded = argument.encode("utf-8")
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+        return digest.hexdigest()
+
+    def test_command_identity_is_stable_and_covers_executable_and_ordered_arguments(self) -> None:
+        original = ["tool", "first", "second"]
+        variants = (
+            ["other-tool", "first", "second"],
+            ["tool", "changed", "second"],
+            ["tool", "second", "first"],
+            ["tool", "firstsecond"],
+        )
+        with patch("auto_coding.test_runner.run_windows_process") as run:
+            run.return_value = WindowsProcessResult(0, False, "not_needed")
+            first = run_approved_tests("workspace", [original], 5)
+            repeated = run_approved_tests("workspace", [original.copy()], 5)
+            changed = [
+                run_approved_tests("workspace", [command], 5).command_results[0].command_identity
+                for command in variants
+            ]
+
+        identity = first.command_results[0].command_identity
+        self.assertEqual(identity, self.expected_command_identity(original))
+        self.assertEqual(identity, repeated.command_results[0].command_identity)
+        self.assertEqual(len(identity), 64)
+        self.assertEqual(len(set([identity, *changed])), 1 + len(variants))
+
     def test_one_passing_command_preserves_argv_and_workspace(self) -> None:
         command = ["py", "-m", "unittest", "tests/test_example.py"]
         workspace = Path(__file__).resolve().parents[1]
@@ -30,6 +65,10 @@ class ApprovedTestRunnerTests(unittest.TestCase):
         self.assertGreaterEqual(result.command_results[0].elapsed_seconds, 0)
         self.assertFalse(result.command_results[0].timed_out)
         self.assertEqual(result.command_results[0].cleanup_result, "not_needed")
+        self.assertEqual(
+            result.command_results[0].command_identity,
+            self.expected_command_identity(command),
+        )
 
     def test_multiple_commands_run_in_exact_order(self) -> None:
         commands = [["tool", "first arg"], ["another-tool", "--exact"]]
@@ -62,6 +101,10 @@ class ApprovedTestRunnerTests(unittest.TestCase):
         self.assertEqual(result.commands_executed, 1)
         self.assertEqual(result.first_failed_index, 1)
         self.assertEqual(result.command_results[0].exit_status, 3)
+        self.assertEqual(
+            result.command_results[0].command_identity,
+            self.expected_command_identity(commands[0]),
+        )
 
     def test_timeout_stops_remaining_commands(self) -> None:
         with patch("auto_coding.test_runner.run_windows_process") as run:
@@ -74,6 +117,10 @@ class ApprovedTestRunnerTests(unittest.TestCase):
         self.assertEqual(result.first_failed_index, 1)
         self.assertTrue(result.command_results[0].timed_out)
         self.assertEqual(result.command_results[0].cleanup_result, "taskkill_completed")
+        self.assertEqual(
+            result.command_results[0].command_identity,
+            self.expected_command_identity(["slow"]),
+        )
 
     def test_missing_executable_fails_safely_and_stops(self) -> None:
         with patch("auto_coding.test_runner.run_windows_process") as run:
@@ -85,6 +132,10 @@ class ApprovedTestRunnerTests(unittest.TestCase):
         self.assertEqual(result.first_failed_index, 1)
         self.assertEqual(result.command_results[0].exit_status, None)
         self.assertEqual(result.command_results[0].cleanup_result, "launch_failed")
+        self.assertEqual(
+            result.command_results[0].command_identity,
+            self.expected_command_identity(["missing"]),
+        )
 
     def test_failed_or_uncertain_cleanup_stops_remaining_commands(self) -> None:
         for cleanup in ("taskkill_failed", "taskkill_timed_out", "parent_not_reaped", "unknown"):
