@@ -1,5 +1,8 @@
 """Tests for the independent, read-only Codex reviewer."""
 
+import base64
+from dataclasses import replace
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -9,7 +12,9 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from auto_coding.integrations.windows_process import WindowsProcessResult
-from auto_coding.review import run_review
+from auto_coding.change_evidence import ChangeEvidence, UntrackedFile
+from auto_coding.review import build_review_packet, run_review
+from auto_coding.test_runner import TestCommandResult, TestRunResult
 
 
 class ReviewTests(unittest.TestCase):
@@ -38,6 +43,263 @@ class ReviewTests(unittest.TestCase):
         }
         value.update(changes)
         return value
+
+    def packet_inputs(self):
+        changed_paths = ("new.bin", "src/app.py")
+        tracked_diff = b"diff --binary\x00\xff"
+        untracked_files = (UntrackedFile("new.bin", b"\x00\x80\xffuntracked"),)
+        digest = hashlib.sha256()
+        digest.update(len(changed_paths).to_bytes(8, "big"))
+        for path in changed_paths:
+            value = path.encode("utf-8")
+            digest.update(len(value).to_bytes(8, "big"))
+            digest.update(value)
+        digest.update(len(tracked_diff).to_bytes(8, "big"))
+        digest.update(tracked_diff)
+        digest.update(len(untracked_files).to_bytes(8, "big"))
+        for item in untracked_files:
+            for value in (item.path.encode("utf-8"), item.contents):
+                digest.update(len(value).to_bytes(8, "big"))
+                digest.update(value)
+        evidence = ChangeEvidence(
+            True, changed_paths, tracked_diff, untracked_files, digest.hexdigest(), None,
+        )
+        commands = [["py", "-m", "unittest", "discover"], ["ruff", "check", "src"]]
+        results = TestRunResult(
+            True, 2,
+            (TestCommandResult(1, 0, 1.25, False, "not_needed"),
+             TestCommandResult(2, 0, 0.5, False, "not_needed")),
+            None,
+        )
+        return {
+            "change_evidence": evidence,
+            "acceptance_criteria": self.criteria.copy(),
+            "approved_test_commands": commands,
+            "test_results": results,
+            "code_context": [("src/app.py", b"code context\x00\xff")],
+            "max_bytes": 100_000,
+        }
+
+    def test_review_packet_is_deterministic_complete_and_preserves_binary(self):
+        inputs = self.packet_inputs()
+        packet = build_review_packet(**inputs)
+        self.assertEqual(packet, build_review_packet(**inputs))
+        value = json.loads(packet.decode("utf-8"))
+        evidence = value["verified_change_evidence"]
+        self.assertEqual(evidence["fingerprint"], inputs["change_evidence"].fingerprint)
+        self.assertTrue(evidence["fingerprint_revalidated"])
+        self.assertEqual(evidence["changed_paths"], ["new.bin", "src/app.py"])
+        self.assertEqual(base64.b64decode(evidence["tracked_diff_base64"]),
+                         inputs["change_evidence"].tracked_diff)
+        self.assertEqual(base64.b64decode(evidence["untracked_files"][0]["contents_base64"]),
+                         b"\x00\x80\xffuntracked")
+
+        caller_inputs = value["caller_supplied_review_inputs"]
+        self.assertEqual(caller_inputs["acceptance_criteria"]["items"], self.criteria)
+        self.assertEqual(caller_inputs["approved_test_commands"]["items"],
+                         inputs["approved_test_commands"])
+        self.assertIn("not verified", caller_inputs["acceptance_criteria"]["provenance"])
+        test_commands = caller_inputs["terminal_test_results"]["commands"]
+        self.assertEqual([item["command"] for item in test_commands],
+                         inputs["approved_test_commands"])
+        self.assertEqual([item["index"] for item in test_commands], [1, 2])
+        self.assertIn("does not retain executed argv",
+                      caller_inputs["terminal_test_results"]["command_binding"])
+        self.assertEqual(caller_inputs["selected_code_context"]["files"][0]["path"],
+                         "src/app.py")
+        self.assertEqual(base64.b64decode(
+            caller_inputs["selected_code_context"]["files"][0]["contents_base64"]),
+            b"code context\x00\xff")
+
+    def test_review_packet_rejects_missing_failed_or_inconsistent_evidence(self):
+        inputs = self.packet_inputs()
+        evidence = inputs["change_evidence"]
+        invalid_evidence = (
+            None,
+            replace(evidence, passed=False),
+            replace(evidence, fingerprint="0" * 64),
+            replace(evidence, tracked_diff=None),
+        )
+        for value in invalid_evidence:
+            with self.subTest(evidence=value):
+                with self.assertRaises(ValueError):
+                    build_review_packet(**(inputs | {"change_evidence": value}))
+
+    def test_review_packet_rejects_missing_or_invalid_criteria(self):
+        inputs = self.packet_inputs()
+        for criteria in ([], [" "], [42], None):
+            with self.subTest(criteria=criteria):
+                with self.assertRaises(ValueError):
+                    build_review_packet(**(inputs | {"acceptance_criteria": criteria}))
+
+    def test_review_packet_rejects_missing_or_invalid_commands_and_size_limit(self):
+        inputs = self.packet_inputs()
+        for commands in ([], None, [[]], [["py", " "]], [["py", 3]]):
+            with self.subTest(commands=commands):
+                with self.assertRaises(ValueError):
+                    build_review_packet(**(inputs | {"approved_test_commands": commands}))
+        for limit in (0, -1, True, 1.5):
+            with self.subTest(limit=limit):
+                with self.assertRaises(ValueError):
+                    build_review_packet(**(inputs | {"max_bytes": limit}))
+
+    def test_review_packet_rejects_missing_inconsistent_or_failed_test_results(self):
+        inputs = self.packet_inputs()
+        valid = inputs["test_results"]
+        invalid_results = (
+            None,
+            replace(valid, passed=False),
+            replace(valid, commands_executed=1),
+            replace(valid, command_results=valid.command_results[:1]),
+            replace(valid, command_results=(valid.command_results[1], valid.command_results[0])),
+            replace(valid, command_results=(
+                replace(valid.command_results[0], index=2), valid.command_results[1],
+            )),
+            replace(valid, command_results=(
+                replace(valid.command_results[0], exit_status=1), valid.command_results[1],
+            )),
+        )
+        for result in invalid_results:
+            with self.subTest(results=result):
+                with self.assertRaises(ValueError):
+                    build_review_packet(**(inputs | {"test_results": result}))
+
+    def test_review_packet_rejects_timeout_and_uncertain_cleanup(self):
+        inputs = self.packet_inputs()
+        valid = inputs["test_results"]
+        cases = (
+            replace(valid.command_results[0], timed_out=True),
+            replace(valid.command_results[0], cleanup_result="taskkill_failed"),
+        )
+        for first in cases:
+            with self.subTest(result=first):
+                failed = replace(valid, command_results=(first, valid.command_results[1]))
+                with self.assertRaises(ValueError):
+                    build_review_packet(**(inputs | {"test_results": failed}))
+
+    def test_review_packet_rejects_missing_or_invalid_code_context(self):
+        inputs = self.packet_inputs()
+        for context in ([], None, [("../private.py", b"secret")],
+                        [("src/file.py", "not bytes")],
+                        [("src/file.py", b"one"), ("src/file.py", b"duplicate")]):
+            with self.subTest(context=context):
+                with self.assertRaises(ValueError):
+                    build_review_packet(**(inputs | {"code_context": context}))
+
+    def test_review_packet_enforces_exact_encoded_size_boundary_without_truncation(self):
+        inputs = self.packet_inputs()
+        complete_packet = build_review_packet(**inputs)
+        exact = build_review_packet(**(inputs | {"max_bytes": len(complete_packet)}))
+        self.assertEqual(exact, complete_packet)
+        with self.assertRaisesRegex(ValueError, "exceeds max_bytes"):
+            build_review_packet(**(inputs | {"max_bytes": len(complete_packet) - 1}))
+        self.assertEqual(build_review_packet(**inputs), complete_packet)
+
+        unicode_inputs = inputs | {
+            "acceptance_criteria": ['Unicode ☃ 😀, quotes " and slash \\'],
+        }
+        unicode_packet = build_review_packet(**unicode_inputs)
+        self.assertEqual(
+            build_review_packet(**(unicode_inputs | {"max_bytes": len(unicode_packet)})),
+            unicode_packet,
+        )
+        with self.assertRaisesRegex(ValueError, "exceeds max_bytes"):
+            build_review_packet(**(
+                unicode_inputs | {"max_bytes": len(unicode_packet) - 1}
+            ))
+
+    def test_review_packet_rejects_oversized_binary_fields_before_base64_encoding(self):
+        inputs = self.packet_inputs()
+        evidence = inputs["change_evidence"]
+
+        def evidence_with(tracked_diff, untracked_contents):
+            changed_paths = evidence.changed_paths
+            files = (UntrackedFile("new.bin", untracked_contents),)
+            digest = hashlib.sha256()
+            digest.update(len(changed_paths).to_bytes(8, "big"))
+            for path in changed_paths:
+                value = path.encode("utf-8")
+                digest.update(len(value).to_bytes(8, "big"))
+                digest.update(value)
+            digest.update(len(tracked_diff).to_bytes(8, "big"))
+            digest.update(tracked_diff)
+            digest.update(len(files).to_bytes(8, "big"))
+            for item in files:
+                for value in (item.path.encode("utf-8"), item.contents):
+                    digest.update(len(value).to_bytes(8, "big"))
+                    digest.update(value)
+            return ChangeEvidence(
+                True, changed_paths, tracked_diff, files, digest.hexdigest(), None,
+            )
+
+        cases = (
+            {"change_evidence": evidence_with(b"x" * 4096, evidence.untracked_files[0].contents)},
+            {"change_evidence": evidence_with(evidence.tracked_diff, b"x" * 4096)},
+            {"code_context": [("src/app.py", b"x" * 4096)]},
+        )
+        for changes in cases:
+            with self.subTest(field=tuple(changes)):
+                with patch("auto_coding.review.base64.b64encode",
+                           side_effect=AssertionError("base64 encoding occurred before size check")):
+                    with self.assertRaisesRegex(ValueError, "exceeds max_bytes"):
+                        build_review_packet(**(inputs | changes | {"max_bytes": 512}))
+
+    def test_review_packet_rejects_oversized_text_before_json_serialization(self):
+        inputs = self.packet_inputs()
+        cases = (
+            {"acceptance_criteria": ["criterion " + "x" * 4096]},
+            {"approved_test_commands": [["py", "x" * 4096], inputs["approved_test_commands"][1]]},
+        )
+        for changes in cases:
+            with self.subTest(field=tuple(changes)):
+                with patch("auto_coding.review.json.dumps",
+                           side_effect=AssertionError("JSON serialization occurred before size check")):
+                    with self.assertRaisesRegex(ValueError, "exceeds max_bytes"):
+                        build_review_packet(**(inputs | changes | {"max_bytes": 512}))
+
+    def test_review_packet_bounds_many_metadata_entries_incrementally(self):
+        inputs = self.packet_inputs()
+        evidence = inputs["change_evidence"]
+
+        class CountingList(list):
+            def __iter__(self):
+                self.iterated = 0
+                for item in super().__iter__():
+                    self.iterated += 1
+                    yield item
+
+        criteria = CountingList(["x"] * 1000)
+        commands = CountingList([["x"] for _ in range(1000)])
+        contexts = CountingList(
+            [(f"src/file_{index:04}.py", b"") for index in range(1000)]
+        )
+        for field, value in (
+            ("acceptance_criteria", criteria),
+            ("approved_test_commands", commands),
+            ("code_context", contexts),
+        ):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(ValueError, "exceeds max_bytes"):
+                    build_review_packet(**(inputs | {field: value, "max_bytes": 256}))
+                self.assertLess(value.iterated, len(value))
+
+        many_paths = tuple(f"src/file_{index:04}.py" for index in range(1000))
+        too_many_paths = replace(evidence, changed_paths=many_paths)
+        with patch("builtins.sorted", side_effect=AssertionError("paths were sorted")):
+            with patch("builtins.set", side_effect=AssertionError("paths were copied to a set")):
+                with self.assertRaisesRegex(ValueError, "exceeds max_bytes"):
+                    build_review_packet(**(
+                        inputs | {"change_evidence": too_many_paths, "max_bytes": 256}
+                    ))
+
+        paths = tuple("a" * index for index in range(1, 13))
+        files = tuple(UntrackedFile(path, b"") for path in paths)
+        many_files = replace(evidence, changed_paths=paths, untracked_files=files)
+        with patch("builtins.set", side_effect=AssertionError("untracked paths were copied to a set")):
+            with self.assertRaisesRegex(ValueError, "exceeds max_bytes"):
+                build_review_packet(**(
+                    inputs | {"change_evidence": many_files, "max_bytes": 300}
+                ))
 
     def run_with_verdict(self, verdict=None, *, raw=None, process=None, events=None,
                          session_id=None):
