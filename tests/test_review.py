@@ -14,7 +14,9 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from auto_coding.integrations.windows_process import WindowsProcessResult
 from auto_coding.change_evidence import ChangeEvidence, UntrackedFile
-from auto_coding.review import build_review_packet, run_review, run_review_packet
+from auto_coding.review import (
+    ReviewResult, _evidence_fingerprint, build_review_packet, run_review, run_review_packet,
+)
 from auto_coding.test_runner import TestCommandResult, TestRunResult, _command_identity
 
 
@@ -371,10 +373,13 @@ class ReviewTests(unittest.TestCase):
                     b"\n\nREVIEW_PACKET_JSON:\n", 1,
                 )
                 self.assertEqual(delivered, expected)
+                self.assertEqual(result.reviewed_packet_sha256,
+                                 hashlib.sha256(delivered).hexdigest())
                 self.assertIn(b"untrusted review data", request)
                 self.assertIn(b"not been authenticated", request)
                 packet = json.loads(delivered)
                 evidence = packet["verified_change_evidence"]
+                self.assertEqual(result.reviewed_evidence_fingerprint, evidence["fingerprint"])
                 self.assertEqual(base64.b64decode(evidence["tracked_diff_base64"]),
                                  inputs["change_evidence"].tracked_diff)
                 self.assertEqual(
@@ -471,6 +476,8 @@ class ReviewTests(unittest.TestCase):
             )
             self.assertEqual(result.error_code, "SESSION_ID_INVALID")
             self.assertFalse(result.approved)
+            self.assertIsNone(result.reviewed_packet_sha256)
+            self.assertIsNone(result.reviewed_evidence_fingerprint)
             runner.assert_not_called()
         for events, error in (
             (self.events("ee39e95b-2222-4444-8888-2cb53be63093"), "SESSION_ID_MISMATCH"),
@@ -499,8 +506,108 @@ class ReviewTests(unittest.TestCase):
                 self.assertFalse(result.approved)
                 self.assertEqual(result.error_code, error)
 
+    def test_approval_bindings_are_stable_and_cover_all_packet_inputs(self):
+        inputs = self.packet_inputs()
+        first = self.run_with_verdict(self.verdict(), packet_inputs=inputs)
+        repeated = self.run_with_verdict(self.verdict(), packet_inputs=inputs)
+        self.assertEqual(first.reviewed_packet_sha256, repeated.reviewed_packet_sha256)
+        self.assertEqual(first.reviewed_evidence_fingerprint,
+                         repeated.reviewed_evidence_fingerprint)
+
+        changed_evidence = replace(inputs["change_evidence"], tracked_diff=b"changed binary\x00\xff")
+        changed_evidence = replace(changed_evidence, fingerprint=_evidence_fingerprint(changed_evidence))
+        commands = [["python", "-m", "unittest", "discover"], ["ruff", "check", "src"]]
+        results = inputs["test_results"]
+        command_results = replace(results, command_results=(
+            replace(results.command_results[0], command_identity=_command_identity(commands[0])),
+            results.command_results[1],
+        ))
+        elapsed_results = replace(results, command_results=(
+            replace(results.command_results[0], elapsed_seconds=2.5),
+            results.command_results[1],
+        ))
+        cases = (
+            ({"change_evidence": changed_evidence}, True),
+            ({"acceptance_criteria": ["Changed criterion"]}, False),
+            ({"approved_test_commands": commands, "test_results": command_results}, False),
+            ({"test_results": elapsed_results}, False),
+            ({"code_context": [("src/app.py", b"changed context\x00\xff")]}, False),
+        )
+        for changes, evidence_changed in cases:
+            with self.subTest(field=tuple(changes)):
+                changed_inputs = inputs | changes
+                packet = build_review_packet(**changed_inputs)
+                result = self.run_with_verdict(
+                    self.verdict(checked_requirements=changed_inputs["acceptance_criteria"]),
+                    packet_inputs=changed_inputs,
+                )
+                self.assertTrue(result.approved)
+                self.assertEqual(result.reviewed_packet_sha256, hashlib.sha256(packet).hexdigest())
+                self.assertNotEqual(result.reviewed_packet_sha256, first.reviewed_packet_sha256)
+                if evidence_changed:
+                    self.assertNotEqual(result.reviewed_evidence_fingerprint,
+                                        first.reviewed_evidence_fingerprint)
+                else:
+                    self.assertEqual(result.reviewed_evidence_fingerprint,
+                                     first.reviewed_evidence_fingerprint)
+
+    def test_approval_bindings_and_criteria_use_the_submitted_packet_snapshot(self):
+        inputs = self.packet_inputs()
+        packet = build_review_packet(**inputs)
+        fingerprint = json.loads(packet)["verified_change_evidence"]["fingerprint"]
+
+        def mutate_caller_data():
+            # Simulate caller changes while the reviewer is running, including
+            # deliberate mutation of a frozen evidence object.
+            object.__setattr__(inputs["change_evidence"], "fingerprint", "0" * 64)
+            inputs["acceptance_criteria"].append("Not in the submitted packet")
+            inputs["approved_test_commands"][0].append("changed argument")
+            inputs["code_context"].clear()
+
+        result = self.run_with_verdict(
+            self.verdict(), packet_inputs=inputs, on_execute=mutate_caller_data,
+        )
+        self.assertTrue(result.approved)
+        self.assertEqual(result.reviewed_packet_sha256, hashlib.sha256(packet).hexdigest())
+        self.assertEqual(result.reviewed_evidence_fingerprint, fingerprint)
+        self.assertEqual(
+            self.calls[-1][1]["input_bytes"].split(b"\n\nREVIEW_PACKET_JSON:\n", 1)[1], packet,
+        )
+        self.assertNotIn("diff --binary", repr(result))
+        self.assertNotIn("code context", repr(result))
+        self.assertNotIn("Not in the submitted packet", repr(result))
+
+    def test_mutating_caller_criteria_cannot_bypass_packet_criteria_coverage(self):
+        inputs = self.packet_inputs()
+        result = self.run_with_verdict(
+            self.verdict(checked_requirements=[]), packet_inputs=inputs,
+            on_execute=inputs["acceptance_criteria"].clear,
+        )
+        self.assertFalse(result.approved)
+        self.assertEqual(result.error_code, "CRITERIA_NOT_COVERED")
+
+    def test_malformed_or_missing_packet_verdicts_have_no_approval_bindings(self):
+        for raw, error in (
+            (b"{malformed private response", "VERDICT_INVALID_JSON"),
+            (None, "VERDICT_MISSING"),
+        ):
+            with self.subTest(error=error):
+                result = self.run_with_verdict(raw=raw, packet_inputs=self.packet_inputs())
+                self.assertFalse(result.approved)
+                self.assertEqual(result.error_code, error)
+                self.assertIsNone(result.reviewed_packet_sha256)
+                self.assertIsNone(result.reviewed_evidence_fingerprint)
+
+    def test_legacy_review_result_construction_has_no_approval_bindings(self):
+        for result in (
+            ReviewResult(False, None, "PROCESS_FAILED", 1, False, "not_needed"),
+            ReviewResult(True, None, None, 0, False, "not_needed", self.SESSION_ID),
+        ):
+            self.assertIsNone(result.reviewed_packet_sha256)
+            self.assertIsNone(result.reviewed_evidence_fingerprint)
+
     def run_with_verdict(self, verdict=None, *, raw=None, process=None, events=None,
-                         session_id=None, packet_inputs=None):
+                         session_id=None, packet_inputs=None, on_execute=None):
         if process is None:
             process = WindowsProcessResult(0, False, "not_needed", "complete")
 
@@ -510,6 +617,8 @@ class ReviewTests(unittest.TestCase):
             schema_path = Path(command[command.index("--output-schema") + 1])
             verdict_path = Path(command[command.index("--output-last-message") + 1])
             self.artifact_paths.extend((schema_path, verdict_path))
+            if on_execute is not None:
+                on_execute()
             if process.exit_status == 0:
                 kwargs["stdout_file"].write(self.events() if events is None else events)
             if process.exit_status == 0 and raw is not None:
@@ -534,6 +643,9 @@ class ReviewTests(unittest.TestCase):
         self.assertTrue(all(not path.exists() for path in self.artifact_paths))
         self.assertTrue(all(file.closed for file in self.output_files))
         self.assertTrue(all(not Path(file.name).exists() for file in self.output_files))
+        if packet_inputs is None or not result.approved:
+            self.assertIsNone(result.reviewed_packet_sha256)
+            self.assertIsNone(result.reviewed_evidence_fingerprint)
         return result
 
     def test_approved_verdict_and_exact_fresh_command(self):

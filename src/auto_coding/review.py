@@ -1,6 +1,6 @@
 """Run one independent, read-only Codex review and validate its verdict."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import base64
 import hashlib
 import json
@@ -160,6 +160,8 @@ class ReviewResult:
     timed_out: bool
     cleanup_result: str
     session_id: str | None = None
+    reviewed_packet_sha256: str | None = None
+    reviewed_evidence_fingerprint: str | None = None
 
 
 def _packet_digest_part(digest, value: bytes) -> None:
@@ -433,15 +435,27 @@ def run_review_packet(
 
     max_bytes bounds the packet; the fixed review request adds constant framing.
     Caller-supplied plan and context provenance remain unverified.
+    Approval bindings record the trusted adapter's association, not independent
+    proof that the reviewer consumed or understood every byte.
     """
     packet = build_review_packet(
         change_evidence, acceptance_criteria, approved_test_commands,
         test_results, code_context, max_bytes,
     )
-    return run_review(
+    snapshot = json.loads(packet)
+    evidence_fingerprint = snapshot["verified_change_evidence"]["fingerprint"]
+    criteria = snapshot["caller_supplied_review_inputs"]["acceptance_criteria"]["items"]
+    del snapshot
+    result = run_review(
         _PACKET_REVIEW_REQUEST + packet.decode("utf-8"),
         model, reasoning_effort, repository_directory, timeout_seconds,
-        acceptance_criteria, session_id=session_id,
+        criteria, session_id=session_id,
+    )
+    if result.approved is not True:
+        return result
+    return replace(
+        result, reviewed_packet_sha256=hashlib.sha256(packet).hexdigest(),
+        reviewed_evidence_fingerprint=evidence_fingerprint,
     )
 
 
