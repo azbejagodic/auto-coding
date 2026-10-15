@@ -13,7 +13,9 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from auto_coding.change_evidence import collect_change_evidence
 import auto_coding.git_publish as git_publish
-from auto_coding.git_publish import check_publish_preflight, stage_reviewed_changes
+from auto_coding.git_publish import (
+    check_publish_preflight, publish_reviewed_changes, stage_reviewed_changes,
+)
 from auto_coding.review import ReviewResult, ReviewVerdict, build_review_packet
 from auto_coding.test_runner import TestCommandResult, TestRunResult, _command_identity
 
@@ -681,6 +683,385 @@ class GitStagingTests(unittest.TestCase):
         self.assertEqual(result.staged_state_error_code, "GIT_TIMEOUT")
         self.assertEqual(add_count, 1)
         self.assertEqual(self.staged_paths(), ("tracked.txt",))
+
+
+class GitPublishingTests(unittest.TestCase):
+    # Reuse the disposable local repository fixture without inheriting and
+    # rerunning the staging test methods.
+    git = GitStagingTests.git
+    approved_snapshot = GitStagingTests.approved_snapshot
+    modify = GitStagingTests.modify
+    stage = GitStagingTests.stage
+
+    def setUp(self):
+        GitStagingTests.setUp(self)
+        self.packet, self.review = self.modify()
+        self.staged = self.stage(self.packet, self.review)
+        self.assertTrue(self.staged.passed, self.staged)
+        self.message = "feat: reviewed fixture change"
+        self.commands = []
+
+    def publish(self, **changes):
+        inputs = {
+            "repository_directory": self.repository, "expected_branch": self.branch,
+            "expected_head": self.head, "expected_origin_url": str(self.remote),
+            "timeout_seconds": 10, "staged_result": self.staged,
+            "reviewed_packet": self.packet, "review_result": self.review,
+            "max_bytes": self.max_bytes, "commit_message": self.message,
+        }
+        original_query = git_publish._git_query
+
+        def observe(repository, arguments, *rest):
+            self.commands.append(arguments)
+            self.assertNotIn(arguments[0], ("add", "reset", "restore", "merge"))
+            self.assertNotIn("--amend", arguments)
+            self.assertNotIn("--force", arguments)
+            self.assertNotIn("--force-with-lease", arguments)
+            return original_query(repository, arguments, *rest)
+
+        with patch("auto_coding.git_publish._git_query", side_effect=observe):
+            return publish_reviewed_changes(**(inputs | changes))
+
+    def remote_head(self):
+        return self.git("ls-remote", "--refs", "origin", f"refs/heads/{self.branch}") \
+            .decode().split("\t")[0]
+
+    def assert_no_commit(self, result):
+        self.assertFalse(result.passed)
+        self.assertEqual(result.outcome, "NOT_ATTEMPTED")
+        self.assertFalse(result.commit_attempted)
+        self.assertFalse(result.push_attempted)
+        self.assertIsNone(result.commit_sha)
+        self.assertIsNone(result.remote_sha)
+        self.assertEqual(self.git("rev-parse", "HEAD").decode().strip(), self.head)
+        self.assertFalse(any(command[0] in ("commit", "push") for command in self.commands))
+
+    def test_valid_staging_commits_and_pushes_exact_verified_content_once(self):
+        tree = self.git("write-tree").decode().strip()
+        # Explicit command flags must prevent follow-tags configuration from
+        # pushing additional refs. Mirror configuration is rejected separately.
+        self.git("config", "remote.origin.mirror", "false")
+        self.git("config", "push.followTags", "true")
+        self.git("tag", "-a", "not-approved-for-push", "-m", "fixture tag")
+        result = self.publish()
+        self.assertTrue(result.passed, result)
+        self.assertEqual(result.outcome, "PUBLISHED")
+        self.assertTrue(result.commit_attempted)
+        self.assertTrue(result.push_attempted)
+        self.assertEqual(result.commit_sha, self.git("rev-parse", "HEAD").decode().strip())
+        self.assertEqual(result.observed_head_sha, result.commit_sha)
+        self.assertEqual(result.remote_sha, result.commit_sha)
+        self.assertEqual(self.remote_head(), result.commit_sha)
+        self.assertEqual(self.git("rev-parse", "HEAD^").decode().strip(), self.head)
+        self.assertEqual(self.git("rev-parse", "HEAD^{tree}").decode().strip(), tree)
+        self.assertEqual(self.git("rev-list", "--count", "HEAD").strip(), b"2")
+        self.assertEqual(self.git("status", "--porcelain=v1", "-z", "--untracked-files=all"), b"")
+        self.assertEqual(self.git("ls-remote", "--tags", "origin"), b"")
+        self.assertEqual([command for command in self.commands if command[0] == "commit"],
+                         [["commit", "--cleanup=verbatim", "-m", self.message]])
+        self.assertEqual([command for command in self.commands if command[0] == "push"], [[
+            "push", "--porcelain", "--no-force", "--no-mirror", "--no-follow-tags",
+            "--recurse-submodules=no", "origin", f"{result.commit_sha}:refs/heads/{self.branch}",
+        ]])
+        self.assertNotIn("reviewed\n", repr(result))
+        self.assertNotIn(self.message, repr(result))
+
+    def test_additions_binary_and_deletions_publish_correctly(self):
+        # Restore only the fixture's initial staged change, then make a new
+        # reviewed fixture snapshot covering all supported change types.
+        self.git("reset", "-q", "--", "tracked.txt")
+        (self.repository / "deleted.txt").unlink()
+        binary = b"\0\xff\x80reviewed binary"
+        (self.repository / "new.bin").write_bytes(binary)
+        self.packet, self.review = self.approved_snapshot()
+        self.staged = self.stage(self.packet, self.review)
+        self.assertTrue(self.staged.passed, self.staged)
+        result = self.publish()
+        self.assertTrue(result.passed, result)
+        self.assertEqual(self.git("show", "HEAD:new.bin"), binary)
+        self.assertEqual(self.git("show", "HEAD:tracked.txt"), b"reviewed\n")
+        self.assertEqual(self.git("ls-tree", "--name-only", "HEAD", "--", "deleted.txt"), b"")
+        self.assertEqual(self.remote_head(), result.commit_sha)
+
+    def test_missing_approval_bindings_and_failed_stage_results_prevent_commit(self):
+        for changes in (
+            {"review_result": None},
+            {"review_result": replace(self.review, approved=False)},
+            {"review_result": replace(self.review, reviewed_packet_sha256=None)},
+            {"review_result": replace(self.review, reviewed_packet_sha256="0" * 64)},
+            {"review_result": replace(self.review, reviewed_evidence_fingerprint="0" * 64)},
+            {"review_result": replace(self.review, verdict=replace(
+                self.review.verdict, checked_requirements=(),
+            ))},
+            {"staged_result": replace(self.staged, passed=False)},
+            {"staged_result": replace(self.staged, staged_paths=("outside.txt",))},
+            {"staged_result": replace(self.staged, staged_changes_sha256="0" * 64)},
+        ):
+            with self.subTest(field=tuple(changes)):
+                self.assert_no_commit(self.publish(**changes))
+
+    def test_invalid_commit_messages_and_protected_main_prevent_mutation(self):
+        for message in (None, "", " ", "bad\0message", "bad\rmessage", "x" * 4097):
+            with self.subTest(message=message):
+                self.assert_no_commit(self.publish(commit_message=message))
+        self.assert_no_commit(self.publish(expected_branch="main"))
+
+    def test_mirror_configuration_is_rejected_before_commit(self):
+        self.git("config", "remote.origin.mirror", "true")
+        result = self.publish()
+        self.assert_no_commit(result)
+        self.assertEqual(result.error_code, "UNSAFE_PUSH_CONFIGURATION")
+
+    def test_modified_index_tracked_worktree_and_untracked_files_prevent_commit(self):
+        (self.repository / "tracked.txt").write_bytes(b"changed index\n")
+        self.git("add", "--", "tracked.txt")
+        self.assert_no_commit(self.publish())
+        (self.repository / "tracked.txt").write_bytes(b"reviewed\n")
+        self.git("add", "--", "tracked.txt")
+        (self.repository / "tracked.txt").write_bytes(b"unstaged modification\n")
+        self.assert_no_commit(self.publish())
+        (self.repository / "tracked.txt").write_bytes(b"reviewed\n")
+        (self.repository / "outside.txt").write_bytes(b"untracked addition")
+        self.assert_no_commit(self.publish())
+
+    def test_wrong_branch_head_origin_or_remote_prevents_commit(self):
+        for changes in (
+            {"expected_branch": "other"}, {"expected_head": "b" * 40},
+            {"expected_origin_url": "https://other.invalid/private"},
+            {"timeout_seconds": 0},
+        ):
+            with self.subTest(changes=changes):
+                self.assert_no_commit(self.publish(**changes))
+        tree = self.git("rev-parse", "HEAD^{tree}").decode().strip()
+        other = self.git("commit-tree", tree, "-p", self.head, "-m", "remote fixture advance") \
+            .decode().strip()
+        self.git("push", "-q", "origin", f"{other}:refs/heads/{self.branch}")
+        result = self.publish()
+        self.assert_no_commit(result)
+        self.assertEqual(result.error_code, "REMOTE_HEAD_MISMATCH")
+
+    def test_commit_failure_preserves_index_and_does_not_push(self):
+        before = self.git("ls-files", "--stage", "-z")
+        original = git_publish._git_query
+        commits = []
+
+        def query(repository, arguments, *rest):
+            if arguments[0] == "commit":
+                commits.append(arguments)
+                return 1, b"private output", None
+            return original(repository, arguments, *rest)
+
+        with patch("auto_coding.git_publish._git_query", side_effect=query):
+            result = self.publish()
+        self.assertEqual(result.outcome, "COMMIT_FAILED_OR_AMBIGUOUS")
+        self.assertEqual(result.error_code, "GIT_FAILED")
+        self.assertTrue(result.commit_attempted)
+        self.assertFalse(result.push_attempted)
+        self.assertIsNone(result.commit_sha)
+        self.assertEqual(len(commits), 1)
+        self.assertEqual(self.git("ls-files", "--stage", "-z"), before)
+        self.assertEqual(self.git("rev-parse", "HEAD").decode().strip(), self.head)
+        self.assertNotIn("private output", repr(result))
+
+    def test_commit_timeout_after_creation_is_ambiguous_and_never_retried(self):
+        original = git_publish._git_query
+        commits = 0
+
+        def query(repository, arguments, *rest):
+            nonlocal commits
+            result = original(repository, arguments, *rest)
+            if arguments[0] == "commit":
+                commits += 1
+                return None, None, "GIT_TIMEOUT"
+            return result
+
+        with patch("auto_coding.git_publish._git_query", side_effect=query):
+            result = self.publish()
+        self.assertEqual(result.outcome, "COMMIT_FAILED_OR_AMBIGUOUS")
+        self.assertEqual(result.error_code, "GIT_TIMEOUT")
+        self.assertIsNone(result.commit_sha)
+        self.assertFalse(result.push_attempted)
+        self.assertEqual(commits, 1)
+        self.assertNotEqual(self.git("rev-parse", "HEAD").decode().strip(), self.head)
+        self.assertEqual(self.remote_head(), self.head)
+
+    def test_hook_changed_commit_tree_is_not_pushed(self):
+        original = git_publish._git_query
+
+        def query(repository, arguments, *rest):
+            if arguments[0] == "commit":
+                # Deterministically simulate a pre-commit hook staging
+                # unreviewed content before Git creates its commit.
+                (self.repository / "tracked.txt").write_bytes(b"hook changed private code")
+                self.git("add", "--", "tracked.txt")
+            return original(repository, arguments, *rest)
+
+        with patch("auto_coding.git_publish._git_query", side_effect=query):
+            result = self.publish()
+        self.assertEqual(result.outcome, "COMMIT_CREATED_NOT_PUSHED")
+        self.assertEqual(result.error_code, "COMMIT_TREE_MISMATCH")
+        self.assertFalse(result.push_attempted)
+        self.assertIsNone(result.commit_sha)
+        self.assertEqual(result.observed_head_sha, self.git("rev-parse", "HEAD").decode().strip())
+        self.assertEqual(self.remote_head(), self.head)
+        self.assertNotIn("private code", repr(result))
+
+    def test_wrong_commit_parent_is_not_pushed(self):
+        original = git_publish._git_query
+
+        def query(repository, arguments, *rest):
+            code, output, error = original(repository, arguments, *rest)
+            if arguments[:3] == ["--no-replace-objects", "cat-file", "commit"] and error is None:
+                output = output.replace(b"parent " + self.head.encode(), b"parent " + b"b" * 40)
+            return code, output, error
+
+        with patch("auto_coding.git_publish._git_query", side_effect=query):
+            result = self.publish()
+        self.assertEqual(result.outcome, "COMMIT_CREATED_NOT_PUSHED")
+        self.assertEqual(result.error_code, "COMMIT_PARENT_MISMATCH")
+        self.assertFalse(result.push_attempted)
+        self.assertEqual(self.remote_head(), self.head)
+
+    def test_pending_changes_created_by_hook_prevent_push(self):
+        original = git_publish._git_query
+
+        def query(repository, arguments, *rest):
+            result = original(repository, arguments, *rest)
+            if arguments[0] == "commit":
+                (self.repository / "outside.txt").write_bytes(b"hook side effect")
+            return result
+
+        with patch("auto_coding.git_publish._git_query", side_effect=query):
+            result = self.publish()
+        self.assertEqual(result.outcome, "COMMIT_CREATED_NOT_PUSHED")
+        self.assertEqual(result.error_code, "UNEXPECTED_PENDING_CHANGES")
+        self.assertIsNotNone(result.commit_sha)
+        self.assertFalse(result.push_attempted)
+        self.assertEqual(self.remote_head(), self.head)
+
+    def test_branch_changed_by_hook_prevents_push(self):
+        original = git_publish._git_query
+
+        def query(repository, arguments, *rest):
+            result = original(repository, arguments, *rest)
+            if arguments[0] == "commit":
+                self.git("branch", "after-hook")
+                self.git("symbolic-ref", "HEAD", "refs/heads/after-hook")
+            return result
+
+        with patch("auto_coding.git_publish._git_query", side_effect=query):
+            result = self.publish()
+        self.assertEqual(result.outcome, "COMMIT_CREATED_NOT_PUSHED")
+        self.assertEqual(result.error_code, "BRANCH_MISMATCH")
+        self.assertIsNotNone(result.commit_sha)
+        self.assertFalse(result.push_attempted)
+        self.assertEqual(self.remote_head(), self.head)
+
+    def test_remote_change_before_push_preserves_commit_without_publishing(self):
+        original = git_publish._git_query
+        committed = False
+
+        def query(repository, arguments, *rest):
+            nonlocal committed
+            if committed and arguments[0] == "ls-remote":
+                return 0, f"{'b' * 40}\trefs/heads/{self.branch}\n".encode(), None
+            result = original(repository, arguments, *rest)
+            if arguments[0] == "commit":
+                committed = True
+            return result
+
+        with patch("auto_coding.git_publish._git_query", side_effect=query):
+            result = self.publish()
+        self.assertEqual(result.outcome, "COMMIT_CREATED_NOT_PUSHED")
+        self.assertEqual(result.error_code, "REMOTE_HEAD_MISMATCH")
+        self.assertIsNotNone(result.commit_sha)
+        self.assertFalse(result.push_attempted)
+        self.assertFalse(any(command[0] == "push" for command in self.commands))
+
+    def test_push_failure_preserves_verified_local_commit(self):
+        original = git_publish._git_query
+        pushes = 0
+
+        def query(repository, arguments, *rest):
+            nonlocal pushes
+            if arguments[0] == "push":
+                pushes += 1
+                return 1, b"private output", None
+            return original(repository, arguments, *rest)
+
+        with patch("auto_coding.git_publish._git_query", side_effect=query):
+            result = self.publish()
+        self.assertEqual(result.outcome, "PUSH_FAILED_OR_AMBIGUOUS")
+        self.assertEqual(result.error_code, "GIT_FAILED")
+        self.assertTrue(result.push_attempted)
+        self.assertEqual(result.commit_sha, self.git("rev-parse", "HEAD").decode().strip())
+        self.assertEqual(self.remote_head(), self.head)
+        self.assertIsNone(result.remote_sha)
+        self.assertEqual(pushes, 1)
+        self.assertNotIn("private output", repr(result))
+
+    def test_push_timeout_after_remote_update_stops_without_retry(self):
+        original = git_publish._git_query
+        pushes = 0
+
+        def query(repository, arguments, *rest):
+            nonlocal pushes
+            result = original(repository, arguments, *rest)
+            if arguments[0] == "push":
+                pushes += 1
+                return None, None, "GIT_TIMEOUT"
+            return result
+
+        with patch("auto_coding.git_publish._git_query", side_effect=query):
+            result = self.publish()
+        self.assertEqual(result.outcome, "PUSH_FAILED_OR_AMBIGUOUS")
+        self.assertEqual(result.error_code, "GIT_TIMEOUT")
+        self.assertIsNone(result.remote_sha)
+        self.assertEqual(self.remote_head(), result.commit_sha)
+        self.assertEqual(pushes, 1)
+
+    def test_successful_push_requires_independent_matching_remote_sha(self):
+        original = git_publish._git_query
+        pushed = False
+
+        def query(repository, arguments, *rest):
+            nonlocal pushed
+            if pushed and arguments[0] == "ls-remote":
+                return 0, f"{'b' * 40}\trefs/heads/{self.branch}\n".encode(), None
+            result = original(repository, arguments, *rest)
+            if arguments[0] == "push":
+                pushed = True
+            return result
+
+        with patch("auto_coding.git_publish._git_query", side_effect=query):
+            result = self.publish()
+        self.assertEqual(result.outcome, "PUSH_FAILED_OR_AMBIGUOUS")
+        self.assertEqual(result.error_code, "REMOTE_VERIFICATION_MISMATCH")
+        self.assertFalse(result.passed)
+        self.assertEqual(result.remote_sha, "b" * 40)
+
+    def test_unavailable_remote_verification_is_ambiguous_without_retry(self):
+        original = git_publish._git_query
+        pushed = False
+        verifications = 0
+
+        def query(repository, arguments, *rest):
+            nonlocal pushed, verifications
+            if pushed and arguments[0] == "ls-remote":
+                verifications += 1
+                return None, None, "GIT_TIMEOUT"
+            result = original(repository, arguments, *rest)
+            if arguments[0] == "push":
+                pushed = True
+            return result
+
+        with patch("auto_coding.git_publish._git_query", side_effect=query):
+            result = self.publish()
+        self.assertEqual(result.outcome, "PUSH_FAILED_OR_AMBIGUOUS")
+        self.assertEqual(result.error_code, "GIT_TIMEOUT")
+        self.assertIsNone(result.remote_sha)
+        self.assertEqual(verifications, 1)
+        self.assertEqual(self.remote_head(), result.commit_sha)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""Git publishing preflight and verified staging, without commit or push."""
+"""Verified Git staging and publishing with explicit review authorization."""
 
 from dataclasses import dataclass
 import base64
@@ -104,7 +104,7 @@ def check_publish_preflight(
 
 def _check_publish_state(
     repository_directory, expected_branch, expected_head, expected_origin_url, timeout_seconds,
-    *, allow_staged=False,
+    *, allow_staged=False, expected_remote_head=None,
 ):
     try:
         valid_timeout = (
@@ -212,7 +212,7 @@ def _check_publish_state(
         if (len(fields) != 2 or not _SHA.fullmatch(fields[0])
                 or fields[1] != f"refs/heads/{expected_branch}"):
             return GitPreflightResult(False, "MALFORMED_GIT_OUTPUT")
-        if fields[0].lower() != expected_head:
+        if fields[0].lower() != (expected_remote_head or expected_head).lower():
             return GitPreflightResult(False, "REMOTE_HEAD_MISMATCH")
         return GitPreflightResult(True)
     except (UnicodeError, ValueError):
@@ -363,6 +363,66 @@ def _current_review_evidence(repository, expected_head, permitted, max_bytes, qu
     return ChangeEvidence(True, changed, diff, tuple(files), _evidence_fingerprint(evidence))
 
 
+
+def _verify_staged_snapshot(evidence, expected_head, raw_arguments, query, run):
+    raw = query(raw_arguments)
+    entries = _raw_index_entries(raw)
+    if set(entries) != set(evidence.changed_paths):
+        raise _StageFailure("STAGED_PATHS_MISMATCH")
+    invisible_arguments = [
+        "--ita-invisible-in-index" if item == "--ita-visible-in-index" else item
+        for item in raw_arguments
+    ]
+    if query(invisible_arguments) != raw:
+        raise _StageFailure("INTENT_TO_ADD")
+    untracked = {item.path: item.contents for item in evidence.untracked_files}
+    tracked = [path for path in evidence.changed_paths if path not in untracked]
+    if tracked:
+        cached = query([
+            "--literal-pathspecs", "diff", "--cached", "--no-ext-diff", "--no-textconv",
+            "--no-renames", "--binary", "--full-index", expected_head, "--", *tracked,
+        ])
+        if cached != evidence.tracked_diff:
+            raise _StageFailure("STAGED_CONTENT_MISMATCH")
+        # Tie the independently observed index object IDs to the full-index
+        # headers in the approved diff, rather than trusting filenames or
+        # a later diff observation alone.
+        pairs = re.findall(
+            rb"(?m)^index ([0-9a-f]{40})\.\.([0-9a-f]{40})(?: [0-7]{6})?$",
+            evidence.tracked_diff,
+        )
+        approved_pairs = sorted(pair for pair in pairs if pair[0] != pair[1])
+        observed_pairs = sorted(
+            (entries[path][2], entries[path][3]) for path in tracked
+            if entries[path][2] != entries[path][3]
+        )
+        if observed_pairs != approved_pairs:
+            raise _StageFailure("STAGED_CONTENT_MISMATCH")
+    elif evidence.tracked_diff:
+        raise _StageFailure("STAGED_CONTENT_MISMATCH")
+    for path, entry in entries.items():
+        old_mode, new_mode, old_oid, new_oid, status = entry
+        if (old_mode not in (b"000000", b"100644", b"100755")
+                or new_mode not in (b"000000", b"100644", b"100755")
+                or status not in (b"A", b"M", b"D", b"T")):
+            raise _StageFailure("UNVERIFIED_FILE_MODE")
+        index = query(["--literal-pathspecs", "ls-files", "--stage", "-z", "--", path])
+        expected_index = new_mode + b" " + new_oid + b" 0\t" + path.encode("utf-8") + b"\0"
+        if index != (b"" if new_mode == b"000000" else expected_index):
+            raise _StageFailure("STAGED_CONTENT_MISMATCH")
+        if path in untracked:
+            if new_mode != b"100644":
+                raise _StageFailure("UNVERIFIED_FILE_MODE")
+            if query(["cat-file", "blob", new_oid.decode("ascii")]) != untracked[path]:
+                raise _StageFailure("STAGED_CONTENT_MISMATCH")
+    code, output = run(["diff", "--quiet", "--exit-code", "--no-ext-diff", "--no-textconv", "--"])
+    if code != 0 or output:
+        raise _StageFailure("WORKTREE_CHANGED_DURING_STAGING")
+    if query(["ls-files", "--others", "--exclude-standard", "-z"]):
+        raise _StageFailure("WORKTREE_CHANGED_DURING_STAGING")
+    return raw
+
+
 def stage_reviewed_changes(
     repository_directory: str | Path,
     expected_branch: str,
@@ -479,61 +539,7 @@ def stage_reviewed_changes(
             if output:
                 raise _StageFailure("AMBIGUOUS_STAGING_OUTPUT")
 
-        raw = query(raw_arguments)
-        entries = _raw_index_entries(raw)
-        if set(entries) != set(evidence.changed_paths):
-            raise _StageFailure("STAGED_PATHS_MISMATCH")
-        invisible_arguments = [
-            "--ita-invisible-in-index" if item == "--ita-visible-in-index" else item
-            for item in raw_arguments
-        ]
-        if query(invisible_arguments) != raw:
-            raise _StageFailure("INTENT_TO_ADD")
-        untracked = {item.path: item.contents for item in evidence.untracked_files}
-        tracked = [path for path in evidence.changed_paths if path not in untracked]
-        if tracked:
-            cached = query([
-                "--literal-pathspecs", "diff", "--cached", "--no-ext-diff", "--no-textconv",
-                "--no-renames", "--binary", "--full-index", expected_head, "--", *tracked,
-            ])
-            if cached != evidence.tracked_diff:
-                raise _StageFailure("STAGED_CONTENT_MISMATCH")
-            # Tie the independently observed index object IDs to the full-index
-            # headers in the approved diff, rather than trusting filenames or
-            # a later diff observation alone.
-            pairs = re.findall(
-                rb"(?m)^index ([0-9a-f]{40})\.\.([0-9a-f]{40})(?: [0-7]{6})?$",
-                evidence.tracked_diff,
-            )
-            approved_pairs = sorted(pair for pair in pairs if pair[0] != pair[1])
-            observed_pairs = sorted(
-                (entries[path][2], entries[path][3]) for path in tracked
-                if entries[path][2] != entries[path][3]
-            )
-            if observed_pairs != approved_pairs:
-                raise _StageFailure("STAGED_CONTENT_MISMATCH")
-        elif evidence.tracked_diff:
-            raise _StageFailure("STAGED_CONTENT_MISMATCH")
-        for path, entry in entries.items():
-            old_mode, new_mode, old_oid, new_oid, status = entry
-            if (old_mode not in (b"000000", b"100644", b"100755")
-                    or new_mode not in (b"000000", b"100644", b"100755")
-                    or status not in (b"A", b"M", b"D", b"T")):
-                raise _StageFailure("UNVERIFIED_FILE_MODE")
-            index = query(["--literal-pathspecs", "ls-files", "--stage", "-z", "--", path])
-            expected_index = new_mode + b" " + new_oid + b" 0\t" + path.encode("utf-8") + b"\0"
-            if index != (b"" if new_mode == b"000000" else expected_index):
-                raise _StageFailure("STAGED_CONTENT_MISMATCH")
-            if path in untracked:
-                if new_mode != b"100644":
-                    raise _StageFailure("UNVERIFIED_FILE_MODE")
-                if query(["cat-file", "blob", new_oid.decode("ascii")]) != untracked[path]:
-                    raise _StageFailure("STAGED_CONTENT_MISMATCH")
-        code, output = run(["diff", "--quiet", "--exit-code", "--no-ext-diff", "--no-textconv", "--"])
-        if code != 0 or output:
-            raise _StageFailure("WORKTREE_CHANGED_DURING_STAGING")
-        if query(["ls-files", "--others", "--exclude-standard", "-z"]):
-            raise _StageFailure("WORKTREE_CHANGED_DURING_STAGING")
+        raw = _verify_staged_snapshot(evidence, expected_head, raw_arguments, query, run)
         final = _check_publish_state(
             repository, expected_branch, expected_head, expected_origin_url, timeout_seconds,
             allow_staged=True,
@@ -544,6 +550,204 @@ def stage_reviewed_changes(
         if query(raw_arguments) != raw:
             raise _StageFailure("INDEX_CHANGED_DURING_VERIFICATION")
         return finish(verified_raw=raw)
+    except _StageFailure as exc:
+        return finish(str(exc))
+    except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
+        return finish("INVALID_OR_UNVERIFIED_INPUT")
+    except OSError:
+        return finish("GIT_IO_FAILED")
+
+
+@dataclass(frozen=True)
+class GitPublishResult:
+    outcome: str
+    error_code: str | None = None
+    commit_attempted: bool = False
+    push_attempted: bool = False
+    # commit_sha is set only after parent/tree verification; observed_head_sha
+    # can identify an unverified local commit that must not be pushed.
+    commit_sha: str | None = None
+    remote_sha: str | None = None
+    observed_head_sha: str | None = None
+
+    @property
+    def passed(self) -> bool:
+        return self.outcome == "PUBLISHED"
+
+
+def publish_reviewed_changes(
+    repository_directory: str | Path,
+    expected_branch: str,
+    expected_head: str,
+    expected_origin_url: str,
+    timeout_seconds: float,
+    staged_result: GitStageResult,
+    reviewed_packet: bytes,
+    review_result: ReviewResult,
+    max_bytes: int,
+    commit_message: str,
+) -> GitPublishResult:
+    """Commit a reverified index and push its exact commit once.
+
+    Outcomes: NOT_ATTEMPTED, COMMIT_FAILED_OR_AMBIGUOUS,
+    COMMIT_CREATED_NOT_PUSHED, PUSH_FAILED_OR_AMBIGUOUS, PUBLISHED.
+    Errors preserve state, including any commit/push that may already exist.
+    Neither checks nor publication are atomic with other repository users.
+    Approval objects and expected state are trusted adapter/caller inputs;
+    frozen-plan provenance and model comprehension are not established here.
+    """
+    outcome = "NOT_ATTEMPTED"
+    commit_attempted = push_attempted = False
+    commit_sha = remote_sha = observed_head_sha = None
+
+    def finish(error=None):
+        return GitPublishResult(
+            outcome, error, commit_attempted, push_attempted,
+            commit_sha, remote_sha, observed_head_sha,
+        )
+
+    try:
+        evidence = _review_snapshot(reviewed_packet, review_result, max_bytes)
+        if (not isinstance(staged_result, GitStageResult) or staged_result.passed is not True
+                or staged_result.error_code is not None
+                or staged_result.staging_attempted is not True
+                or staged_result.staged_state_error_code is not None
+                or not evidence.changed_paths
+                or staged_result.staged_paths != evidence.changed_paths
+                or not isinstance(staged_result.staged_changes_sha256, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", staged_result.staged_changes_sha256)):
+            raise _StageFailure("INVALID_STAGE_RESULT")
+        if (not isinstance(commit_message, str) or not commit_message.strip()
+                or len(commit_message) > 4096
+                or any(ord(character) < 32 and character not in "\n\t"
+                       or ord(character) == 127 for character in commit_message)
+                or len(commit_message.encode("utf-8")) > 4096):
+            raise _StageFailure("INVALID_COMMIT_MESSAGE")
+        if isinstance(expected_branch, str) and expected_branch.casefold() == "main":
+            raise _StageFailure("PROTECTED_BRANCH")
+        state = _check_publish_state(
+            repository_directory, expected_branch, expected_head, expected_origin_url,
+            timeout_seconds, allow_staged=True,
+        )
+        if not state.passed:
+            raise _StageFailure(state.error_code)
+        repository = Path(repository_directory).resolve(strict=True)
+        expected_head = expected_head.lower()
+        temporary = _external_temporary_directory(repository)
+        if temporary is None:
+            raise _StageFailure("UNSAFE_TEMP_LOCATION")
+        environment = os.environ.copy()
+        if any(name in environment for name in _REPOSITORY_ENVIRONMENT):
+            raise _StageFailure("UNSAFE_GIT_ENVIRONMENT")
+        environment.update(GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="Never")
+
+        def run(arguments):
+            code, output, error = _git_query(
+                repository, arguments, timeout_seconds, temporary, environment, max_bytes,
+            )
+            if error:
+                raise _StageFailure(error)
+            return code, output
+
+        def query(arguments):
+            code, output = run(arguments)
+            if code != 0:
+                raise _StageFailure("GIT_FAILED")
+            return output
+
+        def sha(arguments):
+            value = _line(query(arguments))
+            if not _SHA.fullmatch(value):
+                raise _StageFailure("MALFORMED_GIT_OUTPUT")
+            return value.lower()
+
+        def clean():
+            if query(["status", "--porcelain=v1", "-z", "--untracked-files=all"]):
+                raise _StageFailure("UNEXPECTED_PENDING_CHANGES")
+
+        def no_mirror():
+            code, output = run(["config", "--type=bool", "--get-all", "remote.origin.mirror"])
+            if code == 1 and not output:
+                return  # No mirror setting: Git defaults to a normal push.
+            if code != 0 or _line(output) != "false":
+                raise _StageFailure("UNSAFE_PUSH_CONFIGURATION")
+
+        raw_arguments = [
+            "diff", "--cached", "--no-ext-diff", "--no-textconv", "--no-renames",
+            "--raw", "--abbrev=40", "-z", "--ita-visible-in-index", expected_head, "--",
+        ]
+        raw = _verify_staged_snapshot(evidence, expected_head, raw_arguments, query, run)
+        if hashlib.sha256(raw).hexdigest() != staged_result.staged_changes_sha256:
+            raise _StageFailure("STAGE_BINDING_MISMATCH")
+        no_mirror()
+        # write-tree captures the exact index tree; it does not stage files or
+        # update history. It runs only after all authorization checks succeed.
+        tree = sha(["write-tree"])
+        state = _check_publish_state(
+            repository, expected_branch, expected_head, expected_origin_url,
+            timeout_seconds, allow_staged=True,
+        )
+        if not state.passed:
+            raise _StageFailure(state.error_code)
+        if _verify_staged_snapshot(evidence, expected_head, raw_arguments, query, run) != raw:
+            raise _StageFailure("INDEX_CHANGED_DURING_VERIFICATION")
+
+        outcome = "COMMIT_FAILED_OR_AMBIGUOUS"
+        commit_attempted = True
+        query(["commit", "--cleanup=verbatim", "-m", commit_message])
+        observed_head_sha = sha(["rev-parse", "--verify", "HEAD^{commit}"])
+        if observed_head_sha == expected_head:
+            raise _StageFailure("COMMIT_NOT_CREATED")
+        outcome = "COMMIT_CREATED_NOT_PUSHED"
+        # Read the physical commit object, without replacement refs changing
+        # the parent or tree presented by revision-walking commands.
+        commit_object = query(["--no-replace-objects", "cat-file", "commit", observed_head_sha])
+        headers, separator, _message = commit_object.partition(b"\n\n")
+        if not separator:
+            raise _StageFailure("MALFORMED_COMMIT_OBJECT")
+        header_lines = headers.split(b"\n")
+        parents = [line for line in header_lines if line.startswith(b"parent ")]
+        if parents != [b"parent " + expected_head.encode("ascii")]:
+            raise _StageFailure("COMMIT_PARENT_MISMATCH")
+        if header_lines[0] != b"tree " + tree.encode("ascii"):
+            raise _StageFailure("COMMIT_TREE_MISMATCH")
+        commit_sha = observed_head_sha
+        # The local HEAD is new, but the remote must still be the original
+        # expected SHA. Recheck root, branch, URLs, locks and index as well.
+        state = _check_publish_state(
+            repository, expected_branch, commit_sha, expected_origin_url, timeout_seconds,
+            expected_remote_head=expected_head,
+        )
+        if not state.passed:
+            raise _StageFailure(state.error_code)
+        clean()
+        no_mirror()
+        if sha(["rev-parse", "--verify", "HEAD^{commit}"]) != commit_sha:
+            raise _StageFailure("HEAD_CHANGED_DURING_VERIFICATION")
+
+        outcome = "PUSH_FAILED_OR_AMBIGUOUS"
+        push_attempted = True
+        query([
+            "push", "--porcelain", "--no-force", "--no-mirror", "--no-follow-tags",
+            "--recurse-submodules=no", "origin", f"{commit_sha}:refs/heads/{expected_branch}",
+        ])
+        remote = _line(query(
+            ["ls-remote", "--exit-code", "--refs", "origin", f"refs/heads/{expected_branch}"],
+        )).split("\t")
+        if (len(remote) != 2 or not _SHA.fullmatch(remote[0])
+                or remote[1] != f"refs/heads/{expected_branch}"):
+            raise _StageFailure("MALFORMED_REMOTE_OUTPUT")
+        remote_sha = remote[0].lower()
+        if remote_sha != commit_sha:
+            raise _StageFailure("REMOTE_VERIFICATION_MISMATCH")
+        state = _check_publish_state(
+            repository, expected_branch, commit_sha, expected_origin_url, timeout_seconds,
+        )
+        if not state.passed:
+            raise _StageFailure(state.error_code)
+        clean()
+        outcome = "PUBLISHED"
+        return finish()
     except _StageFailure as exc:
         return finish(str(exc))
     except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
