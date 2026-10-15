@@ -1,6 +1,8 @@
 """Tests for read-only Git publishing preflight."""
 
 import os
+from dataclasses import replace
+import hashlib
 from pathlib import Path
 import subprocess
 import sys
@@ -9,7 +11,11 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from auto_coding.git_publish import check_publish_preflight
+from auto_coding.change_evidence import collect_change_evidence
+import auto_coding.git_publish as git_publish
+from auto_coding.git_publish import check_publish_preflight, stage_reviewed_changes
+from auto_coding.review import ReviewResult, ReviewVerdict, build_review_packet
+from auto_coding.test_runner import TestCommandResult, TestRunResult, _command_identity
 
 
 class GitPreflightTests(unittest.TestCase):
@@ -285,6 +291,396 @@ class GitPreflightTests(unittest.TestCase):
         result = check_publish_preflight(repository, self.branch, head, str(remote), 10)
         self.assertTrue(result.passed, result)
         self.assertEqual(self.snapshot(repository), before)
+
+
+class GitStagingTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.parent = Path(temporary.name).resolve()
+        self.repository = self.parent / "repo"
+        self.remote = self.parent / "remote.git"
+        self.repository.mkdir()
+        self.branch = "feature/staging"
+        self.git("init", "-q")
+        self.git("config", "user.name", "Staging Tests")
+        self.git("config", "user.email", "staging@example.invalid")
+        self.git("config", "core.autocrlf", "false")
+        self.git("config", "core.filemode", "false")
+        (self.repository / "tracked.txt").write_bytes(b"original\n")
+        (self.repository / "deleted.txt").write_bytes(b"delete me\n")
+        self.git("add", "--", "tracked.txt", "deleted.txt")
+        self.git("commit", "-qm", "initial")
+        self.git("branch", "-M", self.branch)
+        self.git("init", "--bare", "-q", str(self.remote))
+        self.git("remote", "add", "origin", str(self.remote))
+        self.git("push", "-q", "origin", self.branch)
+        self.head = self.git("rev-parse", "HEAD").decode().strip()
+        self.permitted = ["tracked.txt", "deleted.txt", "new.bin", "-option.txt"]
+        self.criteria = ["Exact changes reviewed"]
+        self.command = ["test-tool", "--exact"]
+        self.max_bytes = 100_000
+        self.add_calls = []
+
+    def git(self, *arguments):
+        with tempfile.TemporaryFile(mode="w+b") as output:
+            subprocess.run(
+                ["git", *arguments], cwd=self.repository, stdin=subprocess.DEVNULL,
+                stdout=output, stderr=subprocess.DEVNULL, shell=False, check=True, timeout=10,
+            )
+            output.seek(0)
+            data = output.read(100_001)
+            self.assertLessEqual(len(data), 100_000)
+            return data
+
+    def approved_snapshot(self):
+        evidence = collect_change_evidence(self.repository, self.permitted, self.max_bytes)
+        self.assertTrue(evidence.passed, evidence)
+        results = TestRunResult(True, 1, (
+            TestCommandResult(1, 0, 0.25, False, "not_needed", _command_identity(self.command)),
+        ), None)
+        packet = build_review_packet(
+            evidence, self.criteria, [self.command], results,
+            [("tracked.txt", b"selected code")], self.max_bytes,
+        )
+        review = ReviewResult(
+            True, ReviewVerdict("APPROVED", (), (), tuple(self.criteria), "HIGH"),
+            None, 0, False, "not_needed", "a26947d0-1111-4444-8888-849398fad344",
+            hashlib.sha256(packet).hexdigest(), evidence.fingerprint,
+        )
+        return packet, review
+
+    def modify(self):
+        (self.repository / "tracked.txt").write_bytes(b"reviewed\n")
+        return self.approved_snapshot()
+
+    def stage(self, packet, review, **changes):
+        inputs = {
+            "repository_directory": self.repository, "expected_branch": self.branch,
+            "expected_head": self.head, "expected_origin_url": str(self.remote),
+            "timeout_seconds": 10, "permitted_files": self.permitted,
+            "reviewed_packet": packet, "review_result": review, "max_bytes": self.max_bytes,
+        }
+        return stage_reviewed_changes(**(inputs | changes))
+
+    def intercept_add(self, action):
+        original_run = subprocess.run
+
+        def execute(command, **kwargs):
+            # Only the implementation's literal add is intercepted. Fixture
+            # mutations inside action use ordinary, explicitly scoped commands.
+            if command[:4] == ["git", "--no-optional-locks", "--literal-pathspecs", "add"]:
+                self.add_calls.append(command)
+                result = original_run(command, **kwargs)
+                return action(command, kwargs, result)
+            self.assertNotIn("commit", command)
+            self.assertNotIn("push", command)
+            self.assertNotIn("reset", command)
+            self.assertNotIn("restore", command)
+            return original_run(command, **kwargs)
+
+        return patch("auto_coding.git_publish.subprocess.run", side_effect=execute)
+
+    def staged_paths(self):
+        return tuple(sorted(self.git("diff", "--cached", "--name-only", "-z", self.head, "--")
+                            .decode().split("\0")[:-1]))
+
+    def test_exact_tracked_additions_deletions_and_binary_content_are_staged(self):
+        (self.repository / "tracked.txt").write_bytes(b"reviewed\n")
+        (self.repository / "deleted.txt").unlink()
+        binary = b"\0\xff\x80new binary"
+        (self.repository / "new.bin").write_bytes(binary)
+        packet, review = self.approved_snapshot()
+        with self.intercept_add(lambda command, kwargs, result: result):
+            result = self.stage(packet, review)
+        self.assertTrue(result.passed, result)
+        self.assertTrue(result.staging_attempted)
+        self.assertEqual(result.staged_paths, ("deleted.txt", "new.bin", "tracked.txt"))
+        self.assertEqual(result.staged_paths, self.staged_paths())
+        self.assertEqual(len(result.staged_changes_sha256), 64)
+        self.assertEqual(self.git("show", ":new.bin"), binary)
+        self.assertEqual(self.git("show", ":tracked.txt"), b"reviewed\n")
+        self.assertEqual(self.git("rev-parse", "HEAD").decode().strip(), self.head)
+        self.assertEqual(self.git("ls-remote", "--refs", "origin", f"refs/heads/{self.branch}")
+                         .decode().split("\t")[0], self.head)
+        self.assertEqual([call[4:] for call in self.add_calls], [
+            ["--all", "--", "deleted.txt"], ["--all", "--", "new.bin"],
+            ["--all", "--", "tracked.txt"],
+        ])
+        self.assertNotIn("reviewed\n", repr(result))
+        self.assertNotIn("new binary", repr(result))
+
+    def test_leading_dash_filename_is_staged_literally(self):
+        (self.repository / "-option.txt").write_bytes(b"ordinary addition")
+        packet, review = self.approved_snapshot()
+        with self.intercept_add(lambda command, kwargs, result: result):
+            result = self.stage(packet, review)
+        self.assertTrue(result.passed, result)
+        self.assertEqual(self.staged_paths(), ("-option.txt",))
+        self.assertEqual(self.add_calls[0][-2:], ["--", "-option.txt"])
+
+    def test_missing_mismatched_and_unapproved_bindings_stop_before_add(self):
+        packet, review = self.modify()
+        for invalid in (
+            replace(review, reviewed_packet_sha256=None),
+            replace(review, reviewed_packet_sha256="0" * 64),
+            replace(review, reviewed_evidence_fingerprint=None),
+            replace(review, reviewed_evidence_fingerprint="0" * 64),
+            replace(review, approved=False),
+            replace(review, verdict=replace(review.verdict, decision="REJECTED")),
+            replace(review, verdict=replace(review.verdict, decision="UNCERTAIN")),
+            replace(review, verdict=replace(review.verdict, checked_requirements=())),
+            replace(review, verdict=replace(review.verdict, blocking_issues=("blocker",))),
+            replace(review, timed_out=True),
+            replace(review, session_id="invalid"),
+        ):
+            with self.subTest(review=invalid):
+                with self.intercept_add(lambda command, kwargs, result: result):
+                    result = self.stage(packet, invalid)
+                self.assertFalse(result.passed)
+                self.assertFalse(result.staging_attempted)
+                self.assertEqual(self.staged_paths(), ())
+        self.assertEqual(self.add_calls, [])
+
+    def test_packet_content_mismatch_and_invalid_packet_fail_before_add(self):
+        packet, review = self.modify()
+        for invalid in (packet + b" ", b"{invalid", b"", b"x" * (self.max_bytes + 1)):
+            with self.subTest(size=len(invalid)):
+                result = self.stage(invalid, review)
+                self.assertFalse(result.passed)
+                self.assertFalse(result.staging_attempted)
+        self.assertEqual(self.staged_paths(), ())
+
+    def test_current_evidence_change_after_review_stops_before_add(self):
+        packet, review = self.modify()
+        (self.repository / "tracked.txt").write_bytes(b"not reviewed\n")
+        result = self.stage(packet, review)
+        self.assertEqual(result.error_code, "EVIDENCE_CHANGED")
+        self.assertFalse(result.staging_attempted)
+        self.assertEqual(self.staged_paths(), ())
+
+    def test_out_of_scope_and_wildcard_like_paths_cannot_be_staged(self):
+        packet, review = self.modify()
+        for filename in ("outside.txt", "literal[1].txt"):
+            with self.subTest(filename=filename):
+                path = self.repository / filename
+                path.write_bytes(b"outside")
+                result = self.stage(packet, review)
+                self.assertEqual(result.error_code, "OUT_OF_SCOPE")
+                self.assertFalse(result.staging_attempted)
+                path.unlink()
+        result = self.stage(packet, review, permitted_files=["*.txt"])
+        self.assertFalse(result.passed)
+        self.assertFalse(result.staging_attempted)
+        self.assertEqual(self.staged_paths(), ())
+
+    def test_existing_index_changes_and_intent_to_add_are_preserved(self):
+        packet, review = self.modify()
+        self.git("add", "--", "tracked.txt")
+        before = self.git("ls-files", "--stage", "-z")
+        result = self.stage(packet, review)
+        self.assertEqual(result.error_code, "STAGED_CHANGES")
+        self.assertEqual(self.git("ls-files", "--stage", "-z"), before)
+        # Reset is fixture setup only; the staging implementation never resets.
+        self.git("reset", "-q", "--", "tracked.txt")
+        (self.repository / "new.bin").write_bytes(b"intent")
+        self.git("add", "-N", "--", "new.bin")
+        before = self.git("ls-files", "--stage", "-z")
+        result = self.stage(packet, review)
+        self.assertIn(result.error_code, ("STAGED_CHANGES", "PREEXISTING_INDEX_CHANGES"))
+        self.assertFalse(result.staging_attempted)
+        self.assertEqual(self.git("ls-files", "--stage", "-z"), before)
+
+    def test_unexpected_staged_path_is_reported_and_not_reset(self):
+        packet, review = self.modify()
+        original_run = subprocess.run
+
+        def inject(command, kwargs, result):
+            (self.repository / "outside.txt").write_bytes(b"unexpected")
+            original_run(["git", "add", "--", "outside.txt"], cwd=self.repository,
+                         check=True, timeout=10, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+            return result
+
+        with self.intercept_add(inject):
+            result = self.stage(packet, review)
+        self.assertEqual(result.error_code, "STAGED_PATHS_MISMATCH")
+        self.assertTrue(result.staging_attempted)
+        self.assertEqual(result.staged_paths, ("outside.txt", "tracked.txt"))
+        self.assertEqual(self.staged_paths(), result.staged_paths)
+
+    def test_unexpected_staged_tracked_and_binary_content_cannot_pass(self):
+        for path in ("tracked.txt", "new.bin"):
+            with self.subTest(path=path):
+                if path == "tracked.txt":
+                    packet, review = self.modify()
+                else:
+                    self.git("reset", "-q", "--", "tracked.txt")
+                    (self.repository / "tracked.txt").write_bytes(b"original\n")
+                    (self.repository / "new.bin").write_bytes(b"\0\xffreviewed")
+                    packet, review = self.approved_snapshot()
+                original = (self.repository / path).read_bytes()
+                original_run = subprocess.run
+
+                def inject(command, kwargs, result):
+                    (self.repository / path).write_bytes(b"unreviewed content")
+                    original_run(["git", "add", "--", path], cwd=self.repository,
+                                 check=True, timeout=10, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+                    (self.repository / path).write_bytes(original)
+                    return result
+
+                with self.intercept_add(inject):
+                    result = self.stage(packet, review)
+                self.assertEqual(result.error_code, "STAGED_CONTENT_MISMATCH")
+                self.assertTrue(result.staging_attempted)
+                self.assertEqual(self.git("show", f":{path}"), b"unreviewed content")
+
+    def test_partial_add_failure_or_timeout_reports_index_without_retry(self):
+        packet, review = self.modify()
+
+        def timeout(command, kwargs, result):
+            raise subprocess.TimeoutExpired("private", 10, output=b"private")
+
+        with self.intercept_add(timeout):
+            result = self.stage(packet, review)
+        self.assertEqual(result.error_code, "GIT_TIMEOUT")
+        self.assertTrue(result.staging_attempted)
+        self.assertEqual(result.staged_paths, ("tracked.txt",))
+        self.assertEqual(self.staged_paths(), result.staged_paths)
+        self.assertEqual(len(self.add_calls), 1)
+        self.assertNotIn("private", repr(result))
+
+    def test_nonzero_add_and_ambiguous_add_output_preserve_staged_state(self):
+        packet, review = self.modify()
+
+        def fail(command, kwargs, result):
+            return subprocess.CompletedProcess(command, 1)
+
+        with self.intercept_add(fail):
+            result = self.stage(packet, review)
+        self.assertEqual(result.error_code, "GIT_FAILED")
+        self.assertEqual(result.staged_paths, ("tracked.txt",))
+        self.git("reset", "-q", "--", "tracked.txt")
+
+        def ambiguous(command, kwargs, result):
+            kwargs["stdout"].write(b"private output")
+            return result
+
+        with self.intercept_add(ambiguous):
+            result = self.stage(packet, review)
+        self.assertEqual(result.error_code, "AMBIGUOUS_STAGING_OUTPUT")
+        self.assertEqual(result.staged_paths, ("tracked.txt",))
+        self.assertNotIn("private output", repr(result))
+
+    def test_remote_state_change_during_staging_fails_and_preserves_index(self):
+        packet, review = self.modify()
+        original_run = subprocess.run
+        staged = False
+
+        def execute(command, **kwargs):
+            nonlocal staged
+            if command[:4] == ["git", "--no-optional-locks", "--literal-pathspecs", "add"]:
+                staged = True
+            if staged and command[2:3] == ["ls-remote"]:
+                kwargs["stdout"].write(b"b" * 40 + f"\trefs/heads/{self.branch}\n".encode())
+                return subprocess.CompletedProcess(command, 0)
+            return original_run(command, **kwargs)
+
+        with patch("auto_coding.git_publish.subprocess.run", side_effect=execute):
+            result = self.stage(packet, review)
+        self.assertEqual(result.error_code, "REMOTE_HEAD_MISMATCH")
+        self.assertEqual(result.staged_paths, ("tracked.txt",))
+        self.assertEqual(self.staged_paths(), result.staged_paths)
+
+    def test_failed_preflight_is_reused_and_prevents_staging(self):
+        packet, review = self.modify()
+        failure = git_publish.GitPreflightResult(False, "HEAD_MISMATCH")
+        with patch("auto_coding.git_publish.check_publish_preflight",
+                   return_value=failure) as preflight:
+            result = self.stage(packet, review)
+        preflight.assert_called_once_with(
+            self.repository, self.branch, self.head, str(self.remote), 10,
+        )
+        self.assertEqual(result.error_code, "HEAD_MISMATCH")
+        self.assertFalse(result.staging_attempted)
+        self.assertEqual(self.staged_paths(), ())
+
+    def test_file_replaced_by_directory_before_add_cannot_expand_scope(self):
+        (self.repository / "deleted.txt").unlink()
+        packet, review = self.approved_snapshot()
+        original_location = git_publish._safe_location
+        checks = 0
+
+        def location(repository, path):
+            nonlocal checks
+            if path == "deleted.txt":
+                checks += 1
+                if checks == 2:  # The check immediately before the add.
+                    directory = self.repository / path
+                    directory.mkdir()
+                    (directory / "outside.txt").write_bytes(b"not authorized")
+            return original_location(repository, path)
+
+        with patch("auto_coding.git_publish._safe_location", side_effect=location):
+            result = self.stage(packet, review)
+        self.assertEqual(result.error_code, "UNSAFE_PATH")
+        self.assertFalse(result.staging_attempted)
+        self.assertEqual(self.staged_paths(), ())
+
+    def test_unverified_index_mode_and_post_add_intent_to_add_fail_closed(self):
+        packet, review = self.modify()
+        original_query = git_publish._git_query
+        for failure in ("mode", "intent"):
+            with self.subTest(failure=failure):
+                staged = False
+
+                def query(repository, arguments, *rest):
+                    nonlocal staged
+                    code, output, error = original_query(repository, arguments, *rest)
+                    if arguments[:2] == ["--literal-pathspecs", "add"]:
+                        staged = True
+                    if staged and "--raw" in arguments and error is None:
+                        if failure == "mode":
+                            output = output.replace(b":100644 100644 ", b":100644 120000 ", 1)
+                        elif "--ita-invisible-in-index" in arguments:
+                            output = b""
+                    return code, output, error
+
+                with patch("auto_coding.git_publish._git_query", side_effect=query):
+                    result = self.stage(packet, review)
+                self.assertEqual(result.error_code,
+                                 "UNVERIFIED_FILE_MODE" if failure == "mode" else "INTENT_TO_ADD")
+                self.assertTrue(result.staging_attempted)
+                self.assertEqual(self.staged_paths(), ("tracked.txt",))
+                self.git("reset", "-q", "--", "tracked.txt")
+
+    def test_ambiguous_partial_staging_with_unreadable_index_reports_unknown_state(self):
+        packet, review = self.modify()
+        original_query = git_publish._git_query
+        staged = False
+        add_count = 0
+
+        def query(repository, arguments, *rest):
+            nonlocal staged, add_count
+            if staged and "--raw" in arguments:
+                return None, None, "GIT_TIMEOUT"
+            result = original_query(repository, arguments, *rest)
+            if arguments[:2] == ["--literal-pathspecs", "add"]:
+                staged = True
+                add_count += 1
+                return None, None, "GIT_TIMEOUT"
+            return result
+
+        with patch("auto_coding.git_publish._git_query", side_effect=query):
+            result = self.stage(packet, review)
+        self.assertEqual(result.error_code, "GIT_TIMEOUT")
+        self.assertTrue(result.staging_attempted)
+        self.assertIsNone(result.staged_paths)
+        self.assertIsNone(result.staged_changes_sha256)
+        self.assertEqual(result.staged_state_error_code, "GIT_TIMEOUT")
+        self.assertEqual(add_count, 1)
+        self.assertEqual(self.staged_paths(), ("tracked.txt",))
 
 
 if __name__ == "__main__":

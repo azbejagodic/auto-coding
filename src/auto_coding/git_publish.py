@@ -1,15 +1,28 @@
-"""Read-only Git state checks before a later publishing gate."""
+"""Git publishing preflight and verified staging, without commit or push."""
 
 from dataclasses import dataclass
+import base64
+import hashlib
+import json
 import math
 import os
 from pathlib import Path
 import re
 import subprocess
+import stat
 import tempfile
+import uuid
 
-from auto_coding.change_evidence import _external_temporary_directory
-from auto_coding.plans import PlanValidationError, _branch
+from auto_coding.change_evidence import (
+    ChangeEvidence, UntrackedFile, _external_temporary_directory,
+    _nul_paths, _safe_location, _tracked_paths,
+)
+from auto_coding.plans import PlanValidationError, _branch, _path
+from auto_coding.review import (
+    ReviewResult, ReviewVerdict, _evidence_fingerprint, build_review_packet,
+)
+from auto_coding.scope_check import _changed_paths
+from auto_coding.test_runner import TestCommandResult, TestRunResult
 
 
 _MAX_OUTPUT_BYTES = 64 * 1024
@@ -30,7 +43,8 @@ class GitPreflightResult:
     error_code: str | None = None
 
 
-def _git_query(repository, arguments, timeout_seconds, temporary_directory, environment):
+def _git_query(repository, arguments, timeout_seconds, temporary_directory, environment,
+               max_output_bytes=_MAX_OUTPUT_BYTES):
     try:
         with tempfile.TemporaryFile(mode="w+b", dir=temporary_directory) as output:
             result = subprocess.run(
@@ -40,8 +54,8 @@ def _git_query(repository, arguments, timeout_seconds, temporary_directory, envi
                 timeout=timeout_seconds, env=environment,
             )
             output.seek(0)
-            captured = output.read(_MAX_OUTPUT_BYTES + 1)
-            if len(captured) > _MAX_OUTPUT_BYTES:
+            captured = output.read(max_output_bytes + 1)
+            if len(captured) > max_output_bytes:
                 return None, None, "GIT_OUTPUT_TOO_LARGE"
             return result.returncode, captured, None
     except subprocess.TimeoutExpired:
@@ -83,6 +97,15 @@ def check_publish_preflight(
     reservation: callers must revalidate immediately before later mutations.
     Both effective fetch and push origin URLs must match the supplied URL.
     """
+    return _check_publish_state(
+        repository_directory, expected_branch, expected_head, expected_origin_url, timeout_seconds,
+    )
+
+
+def _check_publish_state(
+    repository_directory, expected_branch, expected_head, expected_origin_url, timeout_seconds,
+    *, allow_staged=False,
+):
     try:
         valid_timeout = (
             not isinstance(timeout_seconds, bool)
@@ -178,7 +201,7 @@ def check_publish_preflight(
             return GitPreflightResult(False, "GIT_FAILED")
         if output:
             return GitPreflightResult(False, "MALFORMED_GIT_OUTPUT")
-        if code == 1:
+        if code == 1 and not allow_staged:
             return GitPreflightResult(False, "STAGED_CHANGES")
         remote, error = query(
             ["ls-remote", "--exit-code", "--refs", "origin", f"refs/heads/{expected_branch}"],
@@ -196,3 +219,334 @@ def check_publish_preflight(
         return GitPreflightResult(False, "MALFORMED_GIT_OUTPUT")
     except OSError:
         return GitPreflightResult(False, "GIT_IO_FAILED")
+
+
+@dataclass(frozen=True)
+class GitStageResult:
+    passed: bool
+    error_code: str | None = None
+    staging_attempted: bool = False
+    # Observed index delta relative to expected_head, not a reservation.
+    staged_paths: tuple[str, ...] | None = None
+    staged_changes_sha256: str | None = None
+    staged_state_error_code: str | None = None
+
+
+class _StageFailure(ValueError):
+    """Carries only a fixed, sanitized error code."""
+
+
+def _review_snapshot(packet, review, max_bytes):
+    if type(max_bytes) is not int or max_bytes <= 0:
+        raise _StageFailure("INVALID_MAX_BYTES")
+    if not isinstance(packet, bytes) or not packet or len(packet) > max_bytes:
+        raise _StageFailure("INVALID_REVIEW_PACKET")
+    if (not isinstance(review, ReviewResult) or review.approved is not True
+            or review.error_code is not None or type(review.exit_status) is not int
+            or review.exit_status != 0 or review.timed_out is not False
+            or review.cleanup_result != "not_needed"
+            or not isinstance(review.verdict, ReviewVerdict)):
+        raise _StageFailure("REVIEW_NOT_APPROVED")
+    session = uuid.UUID(review.session_id) if isinstance(review.session_id, str) else None
+    if session is None or session.int == 0 or str(session) != review.session_id.lower():
+        raise _StageFailure("INVALID_REVIEW_SESSION")
+    if any(not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)
+           for value in (review.reviewed_packet_sha256, review.reviewed_evidence_fingerprint)):
+        raise _StageFailure("REVIEW_BINDING_MISMATCH")
+    if review.reviewed_packet_sha256 != hashlib.sha256(packet).hexdigest():
+        raise _StageFailure("REVIEW_BINDING_MISMATCH")
+
+    data = json.loads(packet)
+    evidence_data = data["verified_change_evidence"]
+    evidence = ChangeEvidence(
+        True, tuple(evidence_data["changed_paths"]),
+        base64.b64decode(evidence_data["tracked_diff_base64"], validate=True),
+        tuple(UntrackedFile(item["path"], base64.b64decode(item["contents_base64"], validate=True))
+              for item in evidence_data["untracked_files"]),
+        evidence_data["fingerprint"],
+    )
+    inputs = data["caller_supplied_review_inputs"]
+    criteria = inputs["acceptance_criteria"]["items"]
+    commands = inputs["approved_test_commands"]["items"]
+    results = TestRunResult(True, len(commands), tuple(
+        TestCommandResult(
+            item["index"], item["exit_status"], item["elapsed_seconds"],
+            item["timed_out"], item["cleanup_result"], item["command_identity"],
+        )
+        for item in inputs["terminal_test_results"]["commands"]
+    ), None)
+    context = [(item["path"], base64.b64decode(item["contents_base64"], validate=True))
+               for item in inputs["selected_code_context"]["files"]]
+    if build_review_packet(evidence, criteria, commands, results, context, max_bytes) != packet:
+        raise _StageFailure("INVALID_REVIEW_PACKET")
+    if review.reviewed_evidence_fingerprint != evidence.fingerprint:
+        raise _StageFailure("REVIEW_BINDING_MISMATCH")
+    verdict = review.verdict
+    if (verdict.decision != "APPROVED" or verdict.confidence not in ("LOW", "MEDIUM", "HIGH")
+            or any(not isinstance(values, tuple) or any(not isinstance(item, str) for item in values)
+                   for values in (verdict.blocking_issues, verdict.nonblocking_notes,
+                                  verdict.checked_requirements))
+            or verdict.blocking_issues
+            or any(criterion not in verdict.checked_requirements for criterion in criteria)):
+        raise _StageFailure("REVIEW_NOT_APPROVED")
+    return evidence
+
+
+def _raw_index_entries(output):
+    """Parse complete full-SHA raw records, retaining modes for verification."""
+    if output and not output.endswith(b"\0"):
+        raise _StageFailure("MALFORMED_GIT_OUTPUT")
+    records = output.split(b"\0")[:-1] if output else []
+    if len(records) % 2:
+        raise _StageFailure("MALFORMED_GIT_OUTPUT")
+    entries = {}
+    for offset in range(0, len(records), 2):
+        match = re.fullmatch(
+            rb":([0-7]{6}) ([0-7]{6}) ([0-9a-f]{40}) ([0-9a-f]{40}) ([AMDTUXB])",
+            records[offset],
+        )
+        if match is None:
+            raise _StageFailure("MALFORMED_GIT_OUTPUT")
+        path = records[offset + 1].decode("utf-8")
+        _path(path, "staged path")
+        if path in entries:
+            raise _StageFailure("MALFORMED_GIT_OUTPUT")
+        entries[path] = match.groups()
+    return entries
+
+
+def _current_review_evidence(repository, expected_head, permitted, max_bytes, query):
+    # Reuse existing parsers and fingerprint semantics, with bounded status
+    # capture rather than the scope check's unbounded PIPE interface.
+    status = query(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+    changed = tuple(sorted(set(_changed_paths(status))))
+    if any(path not in permitted for path in changed):
+        raise _StageFailure("OUT_OF_SCOPE")
+    raw = query(["diff", "--no-ext-diff", "--no-textconv", "--no-renames",
+                 "--raw", "--abbrev=40", "-z", expected_head, "--"])
+    tracked = _tracked_paths(raw)
+    entries = _raw_index_entries(raw)
+    if any(entry[0] not in (b"000000", b"100644", b"100755")
+           or entry[1] not in (b"000000", b"100644", b"100755")
+           or entry[4] not in (b"A", b"M", b"D", b"T") for entry in entries.values()):
+        raise _StageFailure("UNVERIFIED_FILE_MODE")
+    untracked = _nul_paths(query(["ls-files", "--others", "--exclude-standard", "-z"]))
+    if set(changed) != set(tracked) | set(untracked):
+        raise _StageFailure("INCONSISTENT_EVIDENCE")
+    for path in changed:
+        _safe_location(repository, path)
+    diff = query(["diff", "--no-ext-diff", "--no-textconv", "--no-renames",
+                  "--binary", "--full-index", expected_head, "--"])
+    total = len(diff) + sum(len(path.encode("utf-8")) for path in changed)
+    files = []
+    for path in sorted(untracked):
+        target = _safe_location(repository, path)
+        if not stat.S_ISREG(target.lstat().st_mode):
+            raise _StageFailure("UNSAFE_PATH")
+        with target.open("rb") as source:
+            before = os.fstat(source.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                raise _StageFailure("UNSAFE_PATH")
+            if total > max_bytes:
+                raise _StageFailure("EVIDENCE_TOO_LARGE")
+            contents = source.read(max_bytes - total + 1)
+            after = os.fstat(source.fileno())
+        if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+            raise _StageFailure("INCONSISTENT_EVIDENCE")
+        total += len(contents)
+        if total > max_bytes or len(contents) != before.st_size:
+            raise _StageFailure("EVIDENCE_TOO_LARGE")
+        files.append(UntrackedFile(path, contents))
+    if total > max_bytes:
+        raise _StageFailure("EVIDENCE_TOO_LARGE")
+    evidence = ChangeEvidence(True, changed, diff, tuple(files))
+    return ChangeEvidence(True, changed, diff, tuple(files), _evidence_fingerprint(evidence))
+
+
+def stage_reviewed_changes(
+    repository_directory: str | Path,
+    expected_branch: str,
+    expected_head: str,
+    expected_origin_url: str,
+    timeout_seconds: float,
+    permitted_files: list[str],
+    reviewed_packet: bytes,
+    review_result: ReviewResult,
+    max_bytes: int,
+) -> GitStageResult:
+    """Stage a bound, approved snapshot and verify its index delta.
+
+    Permitted paths and expected state are trusted caller inputs; frozen-plan
+    provenance is not established here. Checks and staging are not atomic.
+    Failure after an add preserves the index and reports its observed delta,
+    or explicitly reports that staged state could not be observed. No reset,
+    commit, push, or automatic retry is performed.
+    """
+    attempted = False
+    query = None
+    raw_arguments = None
+
+    def finish(error=None, verified_raw=None):
+        if not attempted:
+            return GitStageResult(False, error)
+        try:
+            raw = verified_raw if verified_raw is not None else query(raw_arguments)
+            entries = _raw_index_entries(raw)
+            return GitStageResult(
+                error is None, error, True, tuple(sorted(entries)),
+                hashlib.sha256(raw).hexdigest(),
+            )
+        except _StageFailure as exc:
+            return GitStageResult(False, error or "STAGED_STATE_UNKNOWN", True,
+                                  staged_state_error_code=str(exc))
+        except (OSError, ValueError):
+            return GitStageResult(False, error or "STAGED_STATE_UNKNOWN", True,
+                                  staged_state_error_code="STAGED_STATE_UNKNOWN")
+
+    try:
+        evidence = _review_snapshot(reviewed_packet, review_result, max_bytes)
+        if not isinstance(permitted_files, list) or not permitted_files:
+            raise _StageFailure("INVALID_PERMITTED_FILES")
+        total = 0
+        for path in permitted_files:
+            _path(path, "permitted path")
+            total += len(path.encode("utf-8")) + 1
+            if total > max_bytes:
+                raise _StageFailure("INVALID_PERMITTED_FILES")
+        permitted = set(permitted_files)
+        if len({path.casefold() for path in permitted_files}) != len(permitted_files):
+            raise _StageFailure("INVALID_PERMITTED_FILES")
+        if not evidence.changed_paths:
+            raise _StageFailure("NO_CHANGES")
+        if any(path not in permitted for path in evidence.changed_paths):
+            raise _StageFailure("OUT_OF_SCOPE")
+        preflight = check_publish_preflight(
+            repository_directory, expected_branch, expected_head, expected_origin_url, timeout_seconds,
+        )
+        if not preflight.passed:
+            raise _StageFailure(preflight.error_code)
+        repository = Path(repository_directory).resolve(strict=True)
+        expected_head = expected_head.lower()
+        temporary = _external_temporary_directory(repository)
+        if temporary is None:
+            raise _StageFailure("UNSAFE_TEMP_LOCATION")
+        environment = os.environ.copy()
+        if any(name in environment for name in _REPOSITORY_ENVIRONMENT):
+            raise _StageFailure("UNSAFE_GIT_ENVIRONMENT")
+        environment.update(GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="Never")
+
+        def run(arguments):
+            code, output, error = _git_query(
+                repository, arguments, timeout_seconds, temporary, environment, max_bytes,
+            )
+            if error:
+                raise _StageFailure(error)
+            return code, output
+
+        def query(arguments):
+            code, output = run(arguments)
+            if code != 0:
+                raise _StageFailure("GIT_FAILED")
+            return output
+
+        raw_arguments = [
+            "diff", "--cached", "--no-ext-diff", "--no-textconv", "--no-renames",
+            "--raw", "--abbrev=40", "-z", "--ita-visible-in-index", expected_head, "--",
+        ]
+        if query(raw_arguments):
+            raise _StageFailure("PREEXISTING_INDEX_CHANGES")
+        current = _current_review_evidence(repository, expected_head, permitted, max_bytes, query)
+        if current.fingerprint != evidence.fingerprint:
+            raise _StageFailure("EVIDENCE_CHANGED")
+        # Revalidate after evidence reads, immediately before the first add.
+        preflight = check_publish_preflight(
+            repository, expected_branch, expected_head, expected_origin_url, timeout_seconds,
+        )
+        if not preflight.passed:
+            raise _StageFailure(preflight.error_code)
+        if query(raw_arguments):
+            raise _StageFailure("PREEXISTING_INDEX_CHANGES")
+        for path in evidence.changed_paths:
+            target = _safe_location(repository, path)
+            try:
+                mode = target.lstat().st_mode
+            except FileNotFoundError:
+                mode = None  # A reviewed deletion is allowed.
+            if mode is not None and not stat.S_ISREG(mode):
+                raise _StageFailure("UNSAFE_PATH")
+            attempted = True  # A launch error or timeout may have an ambiguous outcome.
+            output = query(["--literal-pathspecs", "add", "--all", "--", path])
+            if output:
+                raise _StageFailure("AMBIGUOUS_STAGING_OUTPUT")
+
+        raw = query(raw_arguments)
+        entries = _raw_index_entries(raw)
+        if set(entries) != set(evidence.changed_paths):
+            raise _StageFailure("STAGED_PATHS_MISMATCH")
+        invisible_arguments = [
+            "--ita-invisible-in-index" if item == "--ita-visible-in-index" else item
+            for item in raw_arguments
+        ]
+        if query(invisible_arguments) != raw:
+            raise _StageFailure("INTENT_TO_ADD")
+        untracked = {item.path: item.contents for item in evidence.untracked_files}
+        tracked = [path for path in evidence.changed_paths if path not in untracked]
+        if tracked:
+            cached = query([
+                "--literal-pathspecs", "diff", "--cached", "--no-ext-diff", "--no-textconv",
+                "--no-renames", "--binary", "--full-index", expected_head, "--", *tracked,
+            ])
+            if cached != evidence.tracked_diff:
+                raise _StageFailure("STAGED_CONTENT_MISMATCH")
+            # Tie the independently observed index object IDs to the full-index
+            # headers in the approved diff, rather than trusting filenames or
+            # a later diff observation alone.
+            pairs = re.findall(
+                rb"(?m)^index ([0-9a-f]{40})\.\.([0-9a-f]{40})(?: [0-7]{6})?$",
+                evidence.tracked_diff,
+            )
+            approved_pairs = sorted(pair for pair in pairs if pair[0] != pair[1])
+            observed_pairs = sorted(
+                (entries[path][2], entries[path][3]) for path in tracked
+                if entries[path][2] != entries[path][3]
+            )
+            if observed_pairs != approved_pairs:
+                raise _StageFailure("STAGED_CONTENT_MISMATCH")
+        elif evidence.tracked_diff:
+            raise _StageFailure("STAGED_CONTENT_MISMATCH")
+        for path, entry in entries.items():
+            old_mode, new_mode, old_oid, new_oid, status = entry
+            if (old_mode not in (b"000000", b"100644", b"100755")
+                    or new_mode not in (b"000000", b"100644", b"100755")
+                    or status not in (b"A", b"M", b"D", b"T")):
+                raise _StageFailure("UNVERIFIED_FILE_MODE")
+            index = query(["--literal-pathspecs", "ls-files", "--stage", "-z", "--", path])
+            expected_index = new_mode + b" " + new_oid + b" 0\t" + path.encode("utf-8") + b"\0"
+            if index != (b"" if new_mode == b"000000" else expected_index):
+                raise _StageFailure("STAGED_CONTENT_MISMATCH")
+            if path in untracked:
+                if new_mode != b"100644":
+                    raise _StageFailure("UNVERIFIED_FILE_MODE")
+                if query(["cat-file", "blob", new_oid.decode("ascii")]) != untracked[path]:
+                    raise _StageFailure("STAGED_CONTENT_MISMATCH")
+        code, output = run(["diff", "--quiet", "--exit-code", "--no-ext-diff", "--no-textconv", "--"])
+        if code != 0 or output:
+            raise _StageFailure("WORKTREE_CHANGED_DURING_STAGING")
+        if query(["ls-files", "--others", "--exclude-standard", "-z"]):
+            raise _StageFailure("WORKTREE_CHANGED_DURING_STAGING")
+        final = _check_publish_state(
+            repository, expected_branch, expected_head, expected_origin_url, timeout_seconds,
+            allow_staged=True,
+        )
+        if not final.passed:
+            raise _StageFailure(final.error_code)
+        # Ensure the index did not change during the final state queries.
+        if query(raw_arguments) != raw:
+            raise _StageFailure("INDEX_CHANGED_DURING_VERIFICATION")
+        return finish(verified_raw=raw)
+    except _StageFailure as exc:
+        return finish(str(exc))
+    except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
+        return finish("INVALID_OR_UNVERIFIED_INPUT")
+    except OSError:
+        return finish("GIT_IO_FAILED")
