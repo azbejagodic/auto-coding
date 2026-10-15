@@ -8,6 +8,8 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from auto_coding.plans import PlanValidationError, validate_plan
+from auto_coding.plans import MAX_TEST_SECONDS
+from auto_coding.plan_freeze import plan_fingerprint
 
 
 def make_plan() -> dict:
@@ -37,6 +39,13 @@ def make_plan() -> dict:
             "limits": {"implementation_seconds": 60, "review_seconds": 30},
         }],
     }
+
+
+def make_v2_plan(origin="https://example.invalid/project.git") -> dict:
+    plan = make_plan()
+    plan.update(schema_version=2, expected_origin_url=origin)
+    plan["tasks"][0]["limits"]["test_seconds"] = 120
+    return plan
 
 
 class PlanValidationTests(unittest.TestCase):
@@ -195,6 +204,125 @@ class PlanValidationTests(unittest.TestCase):
                     plan["tasks"][0]["limits"][key] = value
                     with self.assertRaisesRegex(PlanValidationError, key):
                         validate_plan(plan)
+
+
+class PlanVersionTwoTests(unittest.TestCase):
+    def test_valid_v2_keeps_exact_commands_and_explicit_timeout(self):
+        plan = make_v2_plan()
+        plan["tasks"][0]["test_commands"].append(["py", "-m", "compileall", "src"])
+        self.assertEqual(validate_plan(plan), plan)
+        self.assertEqual(plan["tasks"][0]["limits"]["test_seconds"], 120)
+
+    def test_every_task_requires_explicit_test_timeout(self):
+        plan = make_v2_plan()
+        second = deepcopy(plan["tasks"][0])
+        second.update(task_id="task-2", order=2, depends_on=["task-1"])
+        del second["limits"]["test_seconds"]
+        plan["tasks"].append(second)
+        with self.assertRaisesRegex(PlanValidationError, "test_seconds"):
+            validate_plan(plan)
+
+    def test_missing_and_invalid_terminal_timeouts_rejected(self):
+        for value in (0, -1, True, False, 1.5, "120", None, MAX_TEST_SECONDS + 1, 10**100):
+            with self.subTest(value=value):
+                plan = make_v2_plan()
+                plan["tasks"][0]["limits"]["test_seconds"] = value
+                with self.assertRaisesRegex(PlanValidationError, "test_seconds"):
+                    validate_plan(plan)
+        plan = make_v2_plan()
+        del plan["tasks"][0]["limits"]["test_seconds"]
+        with self.assertRaisesRegex(PlanValidationError, "test_seconds"):
+            validate_plan(plan)
+        for seconds in (1, MAX_TEST_SECONDS):
+            plan = make_v2_plan()
+            plan["tasks"][0]["limits"]["test_seconds"] = seconds
+            self.assertEqual(validate_plan(plan), plan)
+
+    def test_timeout_and_remote_identity_change_canonical_fingerprint(self):
+        plan = make_v2_plan()
+        original = plan_fingerprint(plan)
+        changed_timeout = deepcopy(plan)
+        changed_timeout["tasks"][0]["limits"]["test_seconds"] += 1
+        self.assertNotEqual(plan_fingerprint(changed_timeout), original)
+        changed_origin = dict(plan, expected_origin_url="https://example.invalid/other.git")
+        self.assertNotEqual(plan_fingerprint(changed_origin), original)
+        self.assertEqual(plan_fingerprint(deepcopy(plan)), original)
+
+    def test_legitimate_network_and_absolute_local_remotes(self):
+        for origin in (
+            "https://github.com/example/project.git", "http://localhost:8080/project.git",
+            "ssh://git@example.invalid:2222/project.git", "git@example.invalid:project.git",
+            "git://example.invalid/project.git", "ssh://git@[::1]/project.git",
+            "file:///C:/tmp/remote.git", "file:///tmp/remote.git", "file://localhost/tmp/remote.git",
+            "C:\\Users\\Test User\\remote.git", "C:/tmp/remote.git", "/tmp/local remote.git",
+            "\\\\server\\share\\remote.git",
+        ):
+            with self.subTest(origin=origin):
+                self.assertEqual(validate_plan(make_v2_plan(origin))["expected_origin_url"], origin)
+
+    def test_credential_bearing_and_ambiguous_remotes_rejected(self):
+        for origin in (
+            None, 42, "", " ", "-remote", "relative/remote.git", "../remote.git",
+            "https://user:password@example.invalid/repo", "https://token@example.invalid/repo",
+            "ssh://git:password@example.invalid/repo", "https://example.invalid/repo?token=secret",
+            "https://example.invalid/repo?", "https://example.invalid/repo#",
+            "//user:password@example.invalid/repo", "\\\\user:password@host\\share\\repo",
+            "https://example.invalid/repo#secret", "file://user:secret@host/repo",
+            "ext::some-command", "unknown://example.invalid/repo", "https://example.invalid",
+            "https://example.invalid:99999/repo", "https://example.invalid:0/repo",
+            "https://example.invalid/repo\n", "https://example.invalid/repo\0",
+            "https://example.invalid/repo space", "https://bad%40host/repo",
+            "git:password@example.invalid:repo", "https://example.invalid\\repo",
+            "x" * 2049,
+        ):
+            with self.subTest(origin=origin):
+                with self.assertRaisesRegex(PlanValidationError, "expected_origin_url") as error:
+                    validate_plan(make_v2_plan(origin))
+                self.assertNotIn("password", str(error.exception))
+
+    def test_v1_is_not_silently_upgraded(self):
+        plan = make_plan()
+        self.assertEqual(validate_plan(plan), plan)
+        self.assertNotIn("test_seconds", validate_plan(plan)["tasks"][0]["limits"])
+        for modified in (
+            dict(plan, expected_origin_url="https://example.invalid/project.git"),
+            dict(plan, schema_version=3), dict(plan, schema_version=True),
+        ):
+            with self.assertRaises(PlanValidationError):
+                validate_plan(modified)
+        plan["tasks"][0]["limits"]["test_seconds"] = 120
+        with self.assertRaises(PlanValidationError):
+            validate_plan(plan)
+
+    def test_v2_required_origin_and_unknown_fields_rejected(self):
+        plan = make_v2_plan()
+        del plan["expected_origin_url"]
+        with self.assertRaisesRegex(PlanValidationError, "expected_origin_url"):
+            validate_plan(plan)
+        for location in ("plan", "task", "limits", "role"):
+            plan = make_v2_plan()
+            targets = {"plan": plan, "task": plan["tasks"][0], "limits": plan["tasks"][0]["limits"],
+                       "role": plan["tasks"][0]["review"]}
+            targets[location]["unexpected"] = "value"
+            with self.assertRaisesRegex(PlanValidationError, "unexpected"):
+                validate_plan(plan)
+
+    def test_v2_retains_task_structure_and_safety_validation(self):
+        for field, value in (
+            ("task_id", "bad id"), ("order", 2), ("depends_on", ["missing"]),
+            ("test_commands", [["py", 5]]), ("permitted_files", ["../unsafe"]),
+            ("acceptance_criteria", []),
+        ):
+            with self.subTest(field=field):
+                plan = make_v2_plan()
+                plan["tasks"][0][field] = value
+                with self.assertRaises(PlanValidationError):
+                    validate_plan(plan)
+        for field, value in (("model", "gpt-6-astra"), ("prompt", ""), ("reasoning_effort", "ultra")):
+            plan = make_v2_plan()
+            plan["tasks"][0]["review"][field] = value
+            with self.assertRaises(PlanValidationError):
+                validate_plan(plan)
 
 
 if __name__ == "__main__":

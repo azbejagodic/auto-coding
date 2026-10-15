@@ -1,7 +1,10 @@
-"""Strict validation for Auto-Coding v1 task plans."""
+"""Strict validation for task-plan schema versions 1 and 2."""
 
 from copy import deepcopy
+import ipaddress
+from pathlib import PurePosixPath, PureWindowsPath
 import re
+from urllib.parse import urlsplit
 
 
 class PlanValidationError(ValueError):
@@ -15,6 +18,8 @@ _TASK_FIELDS = {
 }
 _ROLE_FIELDS = {"prompt", "model", "reasoning_effort"}
 _LIMIT_FIELDS = {"implementation_seconds", "review_seconds"}
+# An explicit v2 approval can allow at most 24 hours for each terminal command.
+MAX_TEST_SECONDS = 24 * 60 * 60
 _EFFORTS = {"low", "medium", "high", "xhigh"}
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 _MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*\Z")
@@ -91,11 +96,67 @@ def _role(value: object, field: str) -> None:
         raise PlanValidationError(f"{field}.reasoning_effort is invalid")
 
 
+def _origin_url(value: object) -> None:
+    """Accept credential-free Git URLs or absolute local remote paths.
+
+    SSH account names are identities, not passwords. HTTPS userinfo, passwords,
+    query/fragment tokens, helper transports and relative paths are unsupported.
+    This checks URL structure; it cannot identify secrets hidden in path names.
+    """
+    def invalid():
+        raise PlanValidationError("expected_origin_url must be a credential-free Git remote")
+
+    if (not isinstance(value, str) or not value or len(value) > 2048
+            or value != value.strip() or any(ord(c) < 32 or ord(c) == 127 for c in value)):
+        invalid()
+    if PurePosixPath(value).is_absolute() or PureWindowsPath(value).is_absolute():
+        if (any(c in value for c in '<>"|?*')
+                or value.startswith(("//", "\\\\")) and (":" in value or "@" in PureWindowsPath(value).drive)):
+            invalid()
+        return
+    # The common git@host:path form is SSH, never a password-bearing URL.
+    if "://" not in value:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9._-]*@[A-Za-z0-9][A-Za-z0-9.-]*:[^\s\\?#]+", value):
+            invalid()
+        return
+    if any(c.isspace() for c in value) or "\\" in value:
+        invalid()
+    try:
+        remote = urlsplit(value)
+        port = remote.port  # Reject malformed or out-of-range ports.
+        if "?" in value or "#" in value or remote.password is not None:
+            invalid()
+        if remote.scheme == "file":
+            if (remote.netloc not in ("", "localhost") or port is not None
+                    or not remote.path.startswith("/") or remote.path == "/"):
+                invalid()
+            return
+        if remote.scheme not in {"https", "http", "ssh", "git"}:
+            invalid()
+        if not remote.hostname or not remote.path.startswith("/") or remote.path == "/" or port == 0:
+            invalid()
+        host = remote.hostname
+        if ":" in host:
+            ipaddress.IPv6Address(host)
+        elif not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*", host):
+            invalid()
+        if remote.username is not None and (
+            remote.scheme != "ssh" or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9._-]*", remote.username)
+        ):
+            invalid()
+    except ValueError:
+        invalid()
+
+
 def validate_plan(data: object) -> dict:
     """Return an independent validated copy, or raise PlanValidationError."""
-    plan = _fields(data, _PLAN_FIELDS, "plan")
-    if type(plan["schema_version"]) is not int or plan["schema_version"] != 1:
-        raise PlanValidationError("schema_version must be integer 1")
+    version = data.get("schema_version") if isinstance(data, dict) else None
+    fields = _PLAN_FIELDS | {"expected_origin_url"} if type(version) is int and version == 2 else _PLAN_FIELDS
+    plan = _fields(data, fields, "plan")
+    if type(version) is not int or version not in (1, 2):
+        raise PlanValidationError("schema_version must be integer 1 or 2")
+    if version == 2:
+        _origin_url(plan["expected_origin_url"])
     _identifier(plan["batch_id"], "batch_id")
     _branch(plan["expected_branch"])
     if not isinstance(plan["expected_head"], str) or not _SHA.fullmatch(plan["expected_head"]):
@@ -153,11 +214,14 @@ def validate_plan(data: object) -> dict:
         for criterion in criteria:
             _text(criterion, f"{field}.acceptance_criteria")
 
-        limits = _fields(task["limits"], _LIMIT_FIELDS, f"{field}.limits")
-        for name in _LIMIT_FIELDS:
+        limit_fields = _LIMIT_FIELDS | {"test_seconds"} if version == 2 else _LIMIT_FIELDS
+        limits = _fields(task["limits"], limit_fields, f"{field}.limits")
+        for name in limit_fields:
             seconds = limits[name]
             if type(seconds) is not int or seconds <= 0:
                 raise PlanValidationError(f"{field}.limits.{name} must be a positive integer")
+        if version == 2 and limits["test_seconds"] > MAX_TEST_SECONDS:
+            raise PlanValidationError(f"{field}.limits.test_seconds exceeds {MAX_TEST_SECONDS}")
         seen_ids.add(task_id)
 
     return deepcopy(plan)
