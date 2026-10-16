@@ -6,23 +6,30 @@ import math
 import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
+import stat
 import sys
 from urllib.parse import urlsplit
 
-from auto_coding.plan_freeze import PlanIntegrityError, freeze_approved_plan, plan_fingerprint
+from auto_coding.plan_freeze import PlanIntegrityError, freeze_approved_plan, load_frozen_plan, plan_fingerprint
 from auto_coding.plan_preflight import preflight_frozen_plan
 from auto_coding.plans import PlanValidationError, validate_plan
+from auto_coding.orchestrator import (
+    FirstTaskReviewResult, SingleTaskPublishResult, execute_first_task_through_review,
+    export_stopped_batch_report, publish_single_task_batch,
+)
 
 
 _EXAMPLES = r'''PowerShell examples (also available through the installed auto-coding command):
   py -m auto_coding plan validate "C:\Auto Coding\proposed.json"
   py -m auto_coding plan freeze "C:\Auto Coding\proposed.json" --approved-sha256 $approvedSha --destination "C:\Auto Coding\frozen.json" --repository "C:\Projects\Target App"
   py -m auto_coding plan preflight "C:\Auto Coding\frozen.json" --approved-sha256 $approvedSha --repository "C:\Projects\Target App" --git-timeout-seconds 10
+  py -m auto_coding run "C:\Metadata\frozen.json" --approved-sha256 $approvedSha --repository "C:\Projects\DisposableTarget" --metadata-directory "C:\Metadata\batch-001" --repository-id "example/disposable-target" --git-timeout-seconds 10 --evidence-max-bytes 1048576 --packet-max-bytes 2097152 --report-max-bytes 2097152
 
 Review the COMPLETE plan before supplying its confirmed fingerprint to freeze.
 Validation is not approval. An explicit fingerprint argument is a caller
 assertion; matching it does not independently authenticate a human.
-These commands do not execute a batch. Preflight is a snapshot, not a lock.
+Plan commands do not execute a batch. Run executes and publishes one approved
+task. Preflight is a snapshot, not a lock. Run never resumes or retries.
 '''
 
 
@@ -45,6 +52,170 @@ def _positive_timeout(value: str) -> float:
     if not math.isfinite(timeout) or timeout <= 0:
         raise argparse.ArgumentTypeError("positive finite seconds required")
     return timeout
+
+
+def _run_timeout(value: str) -> float:
+    timeout = _positive_timeout(value)
+    if timeout > 86400:
+        raise argparse.ArgumentTypeError("timeout exceeds 86400 seconds")
+    return timeout
+
+
+def _run_bytes(value: str) -> int:
+    try:
+        limit = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("integer byte limit required") from None
+    if not 0 < limit <= 64 * 1024 * 1024:
+        raise argparse.ArgumentTypeError("byte limit must be 1..67108864")
+    return limit
+
+
+def _approval(value: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise argparse.ArgumentTypeError("full lowercase SHA-256 required")
+    return value
+
+
+def _repository_id(value: str) -> str:
+    if len(value) > 256 or not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", value):
+        raise argparse.ArgumentTypeError("owner/repository identifier required")
+    return value
+
+
+def _safe_code(value, fallback):
+    return value if isinstance(value, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", value) else fallback
+
+
+def _metadata_directory(value: str, repository: Path) -> Path:
+    """Reject symlink/junction/reparse components and resolved path aliases.
+
+This check observes the filesystem; it does not lock it against other writers.
+"""
+    requested = Path(value).absolute()
+    if ".." in requested.parts:
+        raise _CliFailure("UNSAFE_METADATA_DIRECTORY")
+    for component in (*reversed(requested.parents), requested):
+        info = component.lstat()
+        if (stat.S_ISLNK(info.st_mode)
+                or getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)):
+            raise _CliFailure("UNSAFE_METADATA_DIRECTORY")
+    resolved = requested.resolve(strict=True)
+    if resolved != requested or not resolved.is_dir() or resolved.is_relative_to(repository):
+        raise _CliFailure("UNSAFE_METADATA_DIRECTORY")
+    return resolved
+
+
+def _show_paths(checkpoint: Path, metadata: Path, result=None) -> None:
+    # JSON quoting prevents control characters in caller-supplied paths from
+    # becoming terminal instructions. Only validated fixed destinations display.
+    print("Checkpoint: " + json.dumps(str(checkpoint), ensure_ascii=True))
+    if result is not None:
+        paths = (*result.report_paths, *result.partial_report_paths)
+        for name in ("batch-report.json", "batch-report.md"):
+            path = metadata / name
+            if path in paths:
+                print("Report: " + json.dumps(str(path), ensure_ascii=True))
+
+
+def _run(args) -> int:
+    phase = "preflight"
+    checkpoint = metadata = None
+    try:
+        repository = Path(args.repository).resolve(strict=True)
+        frozen = _external_artifact(args.frozen_plan_path, args.repository)
+        if Path(args.frozen_plan_path).absolute().is_relative_to(repository):
+            raise _CliFailure("UNSAFE_FROZEN_PLAN_LOCATION")
+        metadata = _metadata_directory(args.metadata_directory, repository)
+        checkpoint = metadata / "batch-checkpoint.json"
+        for path in (checkpoint, metadata / "batch-report.json", metadata / "batch-report.md"):
+            if os.path.lexists(path):
+                raise _CliFailure("METADATA_DESTINATION_EXISTS")
+        print("PREFLIGHT")
+        preflight = preflight_frozen_plan(frozen, args.approved_sha256, repository, args.git_timeout_seconds)
+        if preflight.ready is not True or preflight.error_code is not None:
+            raise _CliFailure(_safe_code(preflight.error_code, "PREFLIGHT_FAILED"))
+        plan = load_frozen_plan(frozen, args.approved_sha256)
+        if plan["schema_version"] != 2:
+            raise _CliFailure("PLAN_SCHEMA_NOT_RUNNABLE")
+        if len(plan["tasks"]) != 1:
+            raise _CliFailure("SINGLE_TASK_BATCH_REQUIRED")
+        phase = "implementation"
+        print("IMPLEMENTATION / TESTS / REVIEW")
+        handoff = execute_first_task_through_review(
+            frozen, args.approved_sha256, repository, checkpoint, args.git_timeout_seconds,
+            args.evidence_max_bytes, args.packet_max_bytes,
+        )
+        if (not isinstance(handoff, FirstTaskReviewResult) or handoff.outcome != "READY_FOR_PUBLICATION"
+                or handoff.error_code is not None or handoff.checkpoint_error_code is not None):
+            stage = getattr(handoff, "stage", None)
+            stage = stage if stage in ("preflight", "implementation", "evidence", "testing", "review", "publishing") else phase
+            reason = _safe_code(getattr(handoff, "error_code", None), "REVIEW_HANDOFF_INVALID")
+            print(f"STOPPED stage={stage} reason={reason}", file=sys.stderr)
+            checkpoint_error = getattr(handoff, "checkpoint_error_code", None)
+            if checkpoint_error is not None:
+                print("Checkpoint: " + _safe_code(checkpoint_error, "CHECKPOINT_FAILED"), file=sys.stderr)
+            try:
+                report = export_stopped_batch_report(handoff, frozen, args.approved_sha256, metadata,
+                                                    args.repository_id, args.report_max_bytes)
+            except (Exception, KeyboardInterrupt):
+                print("Reporting: REPORT_UNAVAILABLE", file=sys.stderr)
+                _show_paths(checkpoint, metadata)
+                return 1
+            if report.error_code is not None:
+                print("Reporting: " + _safe_code(report.error_code, "REPORT_FAILED"), file=sys.stderr)
+            _show_paths(checkpoint, metadata, report)
+            return 1
+        phase = "publishing"
+        print("PUBLICATION / FINALIZATION")
+        result = publish_single_task_batch(
+            handoff, frozen, args.approved_sha256, args.git_timeout_seconds,
+            args.evidence_max_bytes, args.packet_max_bytes, args.report_max_bytes, metadata, args.repository_id,
+        )
+        if not isinstance(result, SingleTaskPublishResult):
+            raise _CliFailure("PUBLICATION_RESULT_UNCERTAIN")
+        complete = (
+            result.outcome == "PUBLISHED_FINALIZED" and result.error_code is None
+            and result.checkpoint_error_code is None and result.report_error_code is None
+            and result.published is True and result.checkpoint_finalized is True and result.reports_exported is True
+            and result.staging_invoked is True and result.publishing_invoked is True
+            and isinstance(result.commit_sha, str) and re.fullmatch(r"[0-9a-fA-F]{40}", result.commit_sha)
+            and result.remote_sha == result.commit_sha
+            and result.report_paths == (metadata / "batch-report.json", metadata / "batch-report.md")
+        )
+        if complete:
+            print("COMPLETED")
+            print("Batch: " + json.dumps(plan["batch_id"]))
+            print("Task: " + json.dumps(plan["tasks"][0]["task_id"]))
+        else:
+            status = "PUBLISHED_BUT_NOT_FINALIZED" if result.published is True else "STOPPED"
+            stage = result.stage if result.stage in ("validation", "staging", "publishing", "checkpoint", "reporting") else phase
+            print(f"{status} stage={stage} reason={_safe_code(result.error_code, 'FINALIZATION_UNVERIFIED')}", file=sys.stderr)
+            print("Outcome: " + _safe_code(result.outcome, "UNVERIFIED"))
+            if result.publishing is not None:
+                print("Git outcome: " + _safe_code(result.publishing.outcome, "UNVERIFIED"))
+            for label, code in (("Checkpoint", result.checkpoint_error_code), ("Reporting", result.report_error_code)):
+                if code is not None:
+                    print(label + ": " + _safe_code(code, "FINALIZATION_FAILED"), file=sys.stderr)
+        for label, sha in (("Commit SHA", result.commit_sha), ("Remote SHA", result.remote_sha)):
+            if isinstance(sha, str) and re.fullmatch(r"[0-9a-fA-F]{40}", sha):
+                print(f"{label}: {sha}")
+        _show_paths(checkpoint, metadata, result)
+        return 0 if complete else 1
+    except _CliFailure as error:
+        reason = _safe_code(str(error), "RUN_FAILED")
+    except (PlanIntegrityError, PlanValidationError):
+        reason = "PLAN_INVALID_OR_UNAPPROVED"
+    except OSError:
+        reason = "IO_FAILED"
+    except KeyboardInterrupt:
+        reason = "INTERRUPTED_STATE_UNCERTAIN"
+    except Exception:
+        reason = "RUN_STATE_UNCERTAIN"
+    print(f"STOPPED stage={phase} reason={reason}", file=sys.stderr)
+    if checkpoint is not None and metadata is not None:
+        _show_paths(checkpoint, metadata)
+    return 1
 
 
 def _unique_keys(pairs):
@@ -107,7 +278,7 @@ def _summary(plan: dict, fingerprint: str) -> None:
 
 def _parser() -> argparse.ArgumentParser:
     parser = _Parser(
-        prog="auto-coding", description="Auto-Coding v1: plan inspection, explicit freezing and read-only preflight",
+        prog="auto-coding", description="Auto-Coding v1: approved plans and single-task execution",
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=_EXAMPLES,
     )
     commands = parser.add_subparsers(dest="command")
@@ -129,6 +300,16 @@ def _parser() -> argparse.ArgumentParser:
     preflight.add_argument("--approved-sha256", required=True, help="explicit approved fingerprint from an independent trusted source")
     preflight.add_argument("--repository", required=True, help="target Git working-tree root")
     preflight.add_argument("--git-timeout-seconds", required=True, type=_positive_timeout, help="positive finite timeout for each read-only Git command")
+    run = commands.add_parser("run", help="execute, review and publish exactly one approved frozen task")
+    run.add_argument("frozen_plan_path", help="approved schema-v2 frozen artifact outside the target repository")
+    run.add_argument("--approved-sha256", required=True, type=_approval, help="explicit trusted approval fingerprint; never inferred")
+    run.add_argument("--repository", required=True, help="target Git working-tree root")
+    run.add_argument("--metadata-directory", required=True, help="existing external directory; no checkpoint or batch reports may exist")
+    run.add_argument("--repository-id", required=True, type=_repository_id, help="owner/repository report label")
+    run.add_argument("--git-timeout-seconds", required=True, type=_run_timeout, help="per-command timeout, positive and at most 86400 seconds")
+    for name in ("evidence", "packet", "report"):
+        run.add_argument(f"--{name}-max-bytes", required=True, type=_run_bytes,
+                         help="explicit byte limit, 1..67108864 (64 MiB)")
     return parser
 
 
@@ -136,6 +317,8 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.command is None:
         return 0  # Preserve the original no-argument entry-point behavior.
+    if args.command == "run":
+        return _run(args)
     try:
         if args.plan_action == "validate":
             plan = _load_proposed_plan(args.plan_path)

@@ -857,5 +857,109 @@ class SingleTaskPublicationTests(unittest.TestCase):
         self.assertEqual(self.git("diff", "--cached", "--name-only"), b"")
 
 
+class StoppedBatchReportTests(unittest.TestCase):
+    git = OrchestratorTests.git
+    implement = OrchestratorTests.implement
+    run_tests_fake = OrchestratorTests.run_tests_fake
+    review = OrchestratorTests.review
+    execute = OrchestratorTests.execute
+
+    def setUp(self):
+        OrchestratorTests.setUp(self)
+        self.plan["tasks"] = self.plan["tasks"][:1]
+        self.frozen_path.unlink()
+        self.approval = plan_fingerprint(self.plan)
+        freeze_approved_plan(self.plan, self.approval, self.frozen_path)
+        self.metadata = self.parent / "Stopped Reports"
+        self.metadata.mkdir()
+
+    def stopped(self):
+        failure = replace(self.a_result, succeeded=False, exit_status=1, error_code="CODEX_FAILED", report=None)
+        return self.execute(implement=lambda *a, **k: failure)
+
+    def export(self, handoff, **changes):
+        values = dict(handoff=handoff, frozen_plan_path=self.frozen_path, approved_sha256=self.approval,
+                      metadata_directory=self.metadata, repository_identifier="example/disposable", report_max_bytes=200000)
+        return orchestrator.export_stopped_batch_report(**(values | changes))
+
+    def test_terminal_stop_exports_observations_without_mutating_checkpoint_or_git(self):
+        handoff = self.stopped()
+        checkpoint = self.checkpoint_path.read_bytes()
+        with patch("auto_coding.orchestrator.stage_reviewed_changes", side_effect=AssertionError("must not stage")), \
+             patch("auto_coding.orchestrator.publish_reviewed_changes", side_effect=AssertionError("must not publish")):
+            result = self.export(handoff)
+        self.assertTrue(result.reports_exported, result)
+        self.assertIsNone(result.error_code)
+        self.assertEqual(result.report_paths, (self.metadata / "batch-report.json", self.metadata / "batch-report.md"))
+        record = json.loads(result.report_paths[0].read_bytes())["tasks"][0]
+        self.assertEqual(record["status"], "stopped")
+        self.assertEqual(record["stop_reason_code"], "CODEX_FAILED")
+        self.assertEqual(record["implementation"]["exit_status"], 1)
+        for field in ("evidence", "terminal_results", "review", "staging", "publishing"):
+            self.assertIsNone(record[field])
+        self.assertEqual(self.checkpoint_path.read_bytes(), checkpoint)
+        self.assertEqual(self.git("rev-parse", "HEAD").decode().strip(), self.head)
+        self.assertEqual(self.git("status", "--porcelain"), b"")
+
+    def test_stop_before_implementation_keeps_pending_task_unavailable(self):
+        self.plan["tasks"][0]["review"]["prompt"] = "\ud800"
+        self.frozen_path.unlink()
+        self.approval = plan_fingerprint(self.plan)
+        freeze_approved_plan(self.plan, self.approval, self.frozen_path)
+        handoff = self.execute()
+        self.assertEqual(handoff.error_code, "REVIEW_INSTRUCTIONS_INVALID")
+        result = self.export(handoff)
+        self.assertTrue(result.reports_exported, result)
+        data = json.loads(result.report_paths[0].read_bytes())
+        self.assertEqual(data["checkpoint"]["status"], "stopped")
+        self.assertEqual(data["tasks"][0]["status"], "pending")
+        self.assertFalse(data["tasks"][0]["implementation_started"])
+        self.assertIsNone(data["tasks"][0]["implementation"])
+
+    def test_missing_or_nonterminal_checkpoint_does_not_invent_stop(self):
+        handoff = self.execute(approved_sha256="0" * 64)
+        result = self.export(handoff)
+        self.assertEqual(result.error_code, "REPORT_CHECKPOINT_UNAVAILABLE")
+        self.assertEqual(list(self.metadata.iterdir()), [])
+        handoff = self.execute()
+        result = self.export(replace(handoff, outcome="STOPPED", error_code="EXECUTION_FAILED"))
+        self.assertEqual(result.error_code, "REPORT_CHECKPOINT_NOT_TERMINAL")
+        self.assertEqual(load_checkpoint(self.checkpoint_path)["status"], "running")
+
+    def test_mismatched_terminal_checkpoint_prevents_export(self):
+        handoff = self.stopped()
+        result = self.export(replace(handoff, implementer_session_id=_B))
+        self.assertEqual(result.error_code, "REPORT_CHECKPOINT_MISMATCH")
+        self.assertFalse(result.reports_exported)
+        self.assertEqual(list(self.metadata.iterdir()), [])
+
+    def test_invalid_observations_are_not_repaired_to_pass_report_validation(self):
+        handoff = self.stopped()
+        malformed = replace(handoff, implementation=replace(handoff.implementation, succeeded=True))
+        result = self.export(malformed)
+        self.assertEqual(result.error_code, "REPORT_INPUT_INVALID_OR_TOO_LARGE")
+        self.assertEqual(list(self.metadata.iterdir()), [])
+
+    def test_report_size_and_no_overwrite_are_preserved(self):
+        handoff = self.stopped()
+        self.assertEqual(self.export(handoff, report_max_bytes=1).error_code, "REPORT_INPUT_INVALID_OR_TOO_LARGE")
+        existing = self.metadata / "batch-report.json"
+        existing.write_bytes(b"preserved")
+        self.assertFalse(self.export(handoff).reports_exported)
+        self.assertEqual(existing.read_bytes(), b"preserved")
+        self.assertFalse((self.metadata / "batch-report.md").exists())
+
+    def test_report_export_failure_and_partial_paths_are_separate_observations(self):
+        handoff = self.stopped()
+        checkpoint = self.checkpoint_path.read_bytes()
+        partial = self.metadata / "batch-report.json"
+        with patch("auto_coding.orchestrator.export_batch_report", side_effect=ReportExportError((partial,))):
+            result = self.export(handoff)
+        self.assertEqual(result.error_code, "REPORT_EXPORT_FAILED")
+        self.assertEqual(result.partial_report_paths, (partial,))
+        self.assertEqual(handoff.error_code, "CODEX_FAILED")
+        self.assertEqual(self.checkpoint_path.read_bytes(), checkpoint)
+
+
 if __name__ == "__main__":
     unittest.main()

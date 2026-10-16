@@ -398,22 +398,27 @@ def _publication_handoff(handoff, plan, approved_sha256, evidence_limit, packet_
         raise _Stop("FROZEN_TASK_PACKET_MISMATCH")
 
 
-def _report_task(handoff, task, checkpoint, staged, publishing, publishing_invoked):
+def _report_task(handoff, task, checkpoint, staged, publishing, publishing_invoked,
+                 *, record_unattempted=True):
     """Explicit safe projection: never dump adapter objects, prompts or bytes."""
     implementation, tests, review = handoff.implementation, handoff.terminal_results, handoff.review
-    claims, verdict = implementation.report, review.verdict
+    claims = implementation.report if isinstance(implementation, ImplementationOutcome) else None
+    verdict = review.verdict if isinstance(review, ReviewResult) else None
     complete = checkpoint["status"] == "completed"
+    pending = checkpoint["stage"] == "pending"
     record = {
         "task_id": task["task_id"], "title": task["title"],
         "objective": "Not separately recorded in the frozen plan; see title and acceptance criteria.",
         "acceptance_criteria": task["acceptance_criteria"], "permitted_files": task["permitted_files"],
         "implementer": {"model": task["implementation"]["model"], "reasoning_effort": task["implementation"]["reasoning_effort"],
-                        "session_id": handoff.implementer_session_id, "session_mode": "fresh"},
+                        "session_id": handoff.implementer_session_id,
+                        "session_mode": "fresh" if handoff.implementation_started else None},
         "reviewer": {"model": task["review"]["model"], "reasoning_effort": task["review"]["reasoning_effort"],
-                     "session_id": handoff.reviewer_session_id, "session_mode": "fresh"},
-        "status": "completed" if complete else "stopped",
-        "failure_stage": None if complete else checkpoint["stage"],
-        "stop_reason_code": checkpoint["stop_reason_code"],
+                     "session_id": handoff.reviewer_session_id,
+                     "session_mode": "fresh" if handoff.review_started else None},
+        "status": "completed" if complete else "pending" if pending else "stopped",
+        "failure_stage": None if complete or pending else checkpoint["stage"],
+        "stop_reason_code": None if pending else checkpoint["stop_reason_code"],
         "implementation_started": handoff.implementation_started, "review_started": handoff.review_started,
         "implementation": {
             "succeeded": implementation.succeeded, "exit_status": implementation.exit_status,
@@ -422,10 +427,11 @@ def _report_task(handoff, task, checkpoint, staged, publishing, publishing_invok
             "session_id": implementation.session_id,
             "model_claims": {"summary": claims.summary, "approach": claims.approach,
                              "files_reported": list(claims.files_reported), "model_reported_confidence": claims.confidence,
-                             "concerns": list(claims.concerns)},
-        },
+                             "concerns": list(claims.concerns)} if claims is not None else None,
+        } if isinstance(implementation, ImplementationOutcome) else None,
         "evidence": {"passed": handoff.evidence.passed, "changed_paths": list(handoff.evidence.changed_paths),
-                     "fingerprint": handoff.evidence.fingerprint, "error_code": handoff.evidence.error_code},
+                     "fingerprint": handoff.evidence.fingerprint, "error_code": handoff.evidence.error_code}
+                    if isinstance(handoff.evidence, ChangeEvidence) else None,
         "approved_command_identities": [_command_identity(command) for command in task["test_commands"]],
         "terminal_results": {
             "passed": tests.passed, "commands_executed": tests.commands_executed, "first_failed_index": tests.first_failed_index,
@@ -433,14 +439,15 @@ def _report_task(handoff, task, checkpoint, staged, publishing, publishing_invok
                                  "exit_status": result.exit_status, "elapsed_seconds": result.elapsed_seconds,
                                  "timed_out": result.timed_out, "cleanup_result": result.cleanup_result}
                                 for result in tests.command_results],
-        },
+        } if isinstance(tests, TestRunResult) else None,
         "review": {"approved": review.approved, "exit_status": review.exit_status, "timed_out": review.timed_out,
                    "cleanup_result": review.cleanup_result, "error_code": review.error_code, "session_id": review.session_id,
                    "reviewed_packet_sha256": review.reviewed_packet_sha256,
                    "reviewed_evidence_fingerprint": review.reviewed_evidence_fingerprint,
                    "model_verdict": {"decision": verdict.decision, "blocking_issues": list(verdict.blocking_issues),
                                      "nonblocking_notes": list(verdict.nonblocking_notes),
-                                     "checked_requirements": list(verdict.checked_requirements), "model_reported_confidence": verdict.confidence}},
+                                     "checked_requirements": list(verdict.checked_requirements), "model_reported_confidence": verdict.confidence}
+                                    if verdict is not None else None} if isinstance(review, ReviewResult) else None,
         "staging": None, "publishing": None, "preserved_evidence_location": None,
     }
     if staged is not None:
@@ -454,13 +461,77 @@ def _report_task(handoff, task, checkpoint, staged, publishing, publishing_invok
                                 "commit_attempted": publishing.commit_attempted, "push_attempted": publishing.push_attempted,
                                 "commit_sha": publishing.commit_sha, "remote_sha": publishing.remote_sha,
                                 "observed_head_sha": publishing.observed_head_sha}
-    elif not publishing_invoked:
+    elif not publishing_invoked and record_unattempted:
         # Known control flow, not a fabricated successful Git result. When a
         # gate was invoked but returned no result, these observations stay None.
         record["publishing"] = {"outcome": "NOT_ATTEMPTED", "error_code": checkpoint["stop_reason_code"],
                                 "commit_attempted": False, "push_attempted": False,
                                 "commit_sha": None, "remote_sha": None, "observed_head_sha": None}
     return record
+
+
+@dataclass(frozen=True)
+class StoppedBatchReportResult:
+    reports_exported: bool = False
+    error_code: str | None = None
+    report_paths: tuple[Path, ...] = field(default=(), repr=False)
+    partial_report_paths: tuple[Path, ...] = field(default=(), repr=False)
+
+
+def export_stopped_batch_report(
+    handoff: FirstTaskReviewResult, frozen_plan_path: str | Path, approved_sha256: str,
+    metadata_directory: str | Path, repository_identifier: str, report_max_bytes: int,
+) -> StoppedBatchReportResult:
+    """Report an actual terminal D16a stop without changing Git or checkpoint state.
+
+Unavailable observations stay None. Invalid/inconsistent observations fail report
+validation rather than being repaired. No checkpoint is manufactured or retried.
+"""
+    try:
+        if (not isinstance(handoff, FirstTaskReviewResult)
+                or handoff.outcome not in ("STOPPED", "STOPPED_BEFORE_IMPLEMENTATION")
+                or handoff.error_code is None):
+            raise _Stop("STOPPED_HANDOFF_INVALID")
+        plan = load_frozen_plan(frozen_plan_path, approved_sha256)
+        if (plan["schema_version"] != 2 or plan_fingerprint(plan) != approved_sha256
+                or len(plan["tasks"]) != 1):
+            raise _Stop("PLAN_INVALID_OR_UNAPPROVED")
+        task = plan["tasks"][0]
+        if handoff.checkpoint_path is None:
+            raise _Stop("REPORT_CHECKPOINT_UNAVAILABLE")
+        repository = Path(handoff.repository_directory).resolve(strict=True)
+        checkpoint_path = Path(handoff.checkpoint_path).resolve(strict=True)
+        if checkpoint_path.is_relative_to(repository):
+            raise _Stop("UNSAFE_CHECKPOINT_LOCATION")
+        state = load_checkpoint(checkpoint_path)
+        if state["status"] != "stopped":
+            raise _Stop("REPORT_CHECKPOINT_NOT_TERMINAL")
+        expected = {"batch_id": plan["batch_id"], "frozen_plan_sha256": approved_sha256,
+                    "expected_branch": plan["expected_branch"], "base_head": plan["expected_head"],
+                    "implementer_session_id": handoff.implementer_session_id,
+                    "reviewer_session_id": handoff.reviewer_session_id,
+                    "stop_reason_code": handoff.error_code}
+        if (any(state[name] != value for name, value in expected.items())
+                or state["current_task_id"] not in (None, task["task_id"])
+                or handoff.batch_id != plan["batch_id"] or handoff.task_id != task["task_id"]
+                or handoff.plan_sha256 != approved_sha256):
+            raise _Stop("REPORT_CHECKPOINT_MISMATCH")
+        record = _report_task(handoff, task, state, None, None, False, record_unattempted=False)
+        paths = export_batch_report(
+            state, {"repository_id": repository_identifier, "started_at": None, "ended_at": None},
+            [record], [], report_max_bytes, destination=metadata_directory, repository_directory=repository,
+        )
+        return StoppedBatchReportResult(True, report_paths=paths)
+    except ReportExportError as error:
+        return StoppedBatchReportResult(error_code="REPORT_EXPORT_FAILED", partial_report_paths=tuple(error.partial_paths[:4]))
+    except BatchReportError:
+        return StoppedBatchReportResult(error_code="REPORT_INPUT_INVALID_OR_TOO_LARGE")
+    except _Stop as error:
+        return StoppedBatchReportResult(error_code=_code(str(error), "REPORT_FAILED"))
+    except KeyboardInterrupt:
+        return StoppedBatchReportResult(error_code="REPORT_EXPORT_INTERRUPTED")
+    except (OSError, CheckpointError, PlanIntegrityError, ValueError, TypeError, AttributeError):
+        return StoppedBatchReportResult(error_code="REPORT_UNAVAILABLE")
 
 
 def publish_single_task_batch(
