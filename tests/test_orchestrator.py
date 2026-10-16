@@ -15,7 +15,11 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import auto_coding.orchestrator as orchestrator
-from auto_coding.batch_state import load_checkpoint, update_checkpoint
+from auto_coding.batch_state import create_checkpoint, load_checkpoint, update_checkpoint
+from auto_coding.batch_report import ReportExportError
+from auto_coding.change_evidence import collect_change_evidence
+import auto_coding.git_publish as git_publish
+from auto_coding.git_publish import GitStageResult, publish_reviewed_changes, stage_reviewed_changes
 from auto_coding.integrations.codex import ImplementationOutcome, ImplementationReport
 from auto_coding.plan_freeze import freeze_approved_plan, plan_fingerprint
 from auto_coding.review import ReviewResult, ReviewVerdict, build_review_packet
@@ -416,6 +420,441 @@ class OrchestratorTests(unittest.TestCase):
         self.assert_stopped(self.execute(implement=implement, evidence_max_bytes=1000), "CONTEXT_TOO_LARGE")
         self.assertEqual(len(self.test_calls), 1)
         self.assertEqual(self.b_calls, [])
+
+
+class SingleTaskPublicationTests(unittest.TestCase):
+    git = OrchestratorTests.git
+    implement = OrchestratorTests.implement
+    run_tests_fake = OrchestratorTests.run_tests_fake
+    review = OrchestratorTests.review
+    execute = OrchestratorTests.execute
+
+    def setUp(self):
+        OrchestratorTests.setUp(self)
+        self.plan["tasks"] = self.plan["tasks"][:1]
+        self.frozen_path.unlink()
+        self.approval = plan_fingerprint(self.plan)
+        freeze_approved_plan(self.plan, self.approval, self.frozen_path)
+        implementation = self.implement()
+        tests = self.run_tests_fake(self.repository, self.plan["tasks"][0]["test_commands"], 13)
+        evidence = collect_change_evidence(self.repository, self.plan["tasks"][0]["permitted_files"], 100_000)
+        context = orchestrator._context(self.repository, self.plan, evidence, 5, 100_000)
+        packet = build_review_packet(evidence, self.plan["tasks"][0]["acceptance_criteria"],
+                                     self.plan["tasks"][0]["test_commands"], tests, context, 200_000)
+        review = self.review(evidence, self.plan["tasks"][0]["acceptance_criteria"],
+                             self.plan["tasks"][0]["test_commands"], tests, context, 200_000)
+        state = {"schema_version": 1, "batch_id": self.plan["batch_id"], "frozen_plan_sha256": self.approval,
+                 "expected_branch": self.branch, "base_head": self.head, "status": "pending", "stage": "pending",
+                 "current_task_id": None, "implementer_session_id": None, "reviewer_session_id": None, "stop_reason_code": None}
+        create_checkpoint(self.checkpoint_path, state)
+        state.update(status="running", stage="publishing", current_task_id="task-1",
+                     implementer_session_id=_A, reviewer_session_id=_B)
+        update_checkpoint(self.checkpoint_path, state)
+        self.handoff = orchestrator.FirstTaskReviewResult(
+            "READY_FOR_PUBLICATION", "publishing", batch_id=self.plan["batch_id"], task_id="task-1", plan_sha256=self.approval,
+            implementer_session_id=_A, reviewer_session_id=_B, implementation_started=True, review_started=True,
+            repository_directory=self.repository, checkpoint_path=self.checkpoint_path, expected_branch=self.branch,
+            expected_head=self.head, expected_origin_url=str(self.remote),
+            permitted_files=tuple(self.plan["tasks"][0]["permitted_files"]), implementation=implementation,
+            terminal_results=tests, evidence=evidence, review=review, reviewed_packet=packet,
+        )
+        self.metadata = self.parent / "Final Reports"
+        self.metadata.mkdir()
+        self.stage_calls, self.publish_calls = [], []
+
+    def publish(self, handoff=None, **changes):
+        inputs = dict(handoff=self.handoff if handoff is None else handoff,
+                      frozen_plan_path=self.frozen_path, approved_sha256=self.approval,
+                      git_timeout_seconds=5, evidence_max_bytes=100_000, packet_max_bytes=200_000,
+                      report_max_bytes=200_000, metadata_directory=self.metadata, repository_identifier="example/project")
+        def stage(*args, **kwargs):
+            self.stage_calls.append((args, kwargs))
+            return stage_reviewed_changes(*args, **kwargs)
+        def publish(*args, **kwargs):
+            self.publish_calls.append((args, kwargs))
+            return publish_reviewed_changes(*args, **kwargs)
+        with patch("auto_coding.orchestrator.stage_reviewed_changes", side_effect=stage), \
+             patch("auto_coding.orchestrator.publish_reviewed_changes", side_effect=publish), \
+             patch("auto_coding.orchestrator.run_implementation", side_effect=AssertionError("extra Codex invocation")), \
+             patch("auto_coding.orchestrator.run_review_packet", side_effect=AssertionError("extra reviewer invocation")), \
+             patch("auto_coding.orchestrator.run_approved_tests", side_effect=AssertionError("extra terminal execution")), \
+             patch("auto_coding.orchestrator.preflight_frozen_plan", side_effect=AssertionError("initial clean preflight repeated")):
+            return orchestrator.publish_single_task_batch(**(inputs | changes))
+
+    def remote_head(self):
+        return self.git("ls-remote", "origin", f"refs/heads/{self.branch}").decode().split("\t")[0]
+
+    def report(self):
+        return json.loads((self.metadata / "batch-report.json").read_bytes())
+
+    def assert_no_mutations(self):
+        self.assertEqual(self.stage_calls, [])
+        self.assertEqual(self.publish_calls, [])
+        self.assertEqual(self.git("rev-parse", "HEAD").decode().strip(), self.head)
+        self.assertEqual(self.remote_head(), self.head)
+
+    def test_actual_d16a_handoff_publishes_exact_binary_changes_once_and_finalizes(self):
+        self.checkpoint_path.unlink()
+        (self.repository / "app.txt").write_bytes(b"original\n")
+        (self.repository / "new.bin").unlink()
+        self.a_calls.clear()
+        self.test_calls.clear()
+        self.b_calls.clear()
+        self.handoff = self.execute()
+        self.assertTrue(self.handoff.ready_for_publication, self.handoff)
+        result = self.publish()
+        self.assertEqual(result.outcome, "PUBLISHED_FINALIZED", result)
+        self.assertTrue(result.published)
+        self.assertTrue(result.checkpoint_finalized)
+        self.assertTrue(result.reports_exported)
+        self.assertEqual(len(self.stage_calls), 1)
+        self.assertEqual(len(self.publish_calls), 1)
+        self.assertIs(self.stage_calls[0][0][6], self.handoff.reviewed_packet)
+        self.assertIs(self.stage_calls[0][0][7], self.handoff.review)
+        self.assertIs(self.publish_calls[0][0][6], self.handoff.reviewed_packet)
+        self.assertEqual(self.publish_calls[0][0][-1], "auto-coding: task-1")
+        self.assertEqual(result.commit_sha, self.git("rev-parse", "HEAD").decode().strip())
+        self.assertEqual(result.remote_sha, result.commit_sha)
+        self.assertEqual(self.remote_head(), result.commit_sha)
+        self.assertEqual(self.git("rev-list", "--count", f"{self.head}..HEAD"), b"1\n")
+        self.assertEqual(self.git("show", "--format=%s", "--no-patch", "HEAD"), b"auto-coding: task-1\n")
+        self.assertEqual(self.git("diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD").splitlines(), [b"app.txt", b"new.bin"])
+        self.assertEqual(self.git("show", "HEAD:new.bin"), b"\0\xffPRIVATE_BINARY\x80")
+        state = load_checkpoint(self.checkpoint_path)
+        self.assertEqual((state["status"], state["stage"], state["current_task_id"]), ("completed", "finished", None))
+        self.assertEqual((state["implementer_session_id"], state["reviewer_session_id"]), (_A, _B))
+        data = self.report()
+        self.assertEqual(data["batch"]["completed_tasks"], 1)
+        self.assertIsNone(data["batch"]["started_at"])
+        self.assertIsNone(data["batch"]["ended_at"])
+        self.assertEqual(data["events"], [])
+        task = data["tasks"][0]
+        self.assertEqual(task["publishing"]["remote_verification"], "verified")
+        self.assertEqual(task["implementation"]["model_claims"]["model_reported_confidence"], "HIGH")
+        self.assertEqual(task["review"]["reviewed_packet_sha256"], self.handoff.review.reviewed_packet_sha256)
+        self.assertEqual(task["approved_command_identities"], [r.command_identity for r in self.handoff.terminal_results.command_results])
+        self.assertIn("Not separately recorded", task["objective"])
+        report_text = (self.metadata / "batch-report.json").read_text() + (self.metadata / "batch-report.md").read_text(encoding="utf-8")
+        for private in ("PRIVATE_LITERAL_IMPLEMENTATION", "PRIVATE_LITERAL_REVIEW", "PRIVATE_ARG", "PRIVATE_BINARY", "tracked_diff_base64"):
+            self.assertNotIn(private, report_text)
+            self.assertNotIn(private, repr(result))
+        self.assertEqual((len(self.a_calls), len(self.test_calls), len(self.b_calls)), (1, 1, 1))
+
+    def test_invalid_or_inconsistent_handoffs_never_reach_staging(self):
+        variants = (object(), replace(self.handoff, outcome="STOPPED"), replace(self.handoff, error_code="FAILED"),
+                    replace(self.handoff, checkpoint_error_code="FAILED"), replace(self.handoff, batch_id="other"),
+                    replace(self.handoff, task_id="task-2"), replace(self.handoff, plan_sha256="0" * 64),
+                    replace(self.handoff, expected_branch="other"), replace(self.handoff, expected_head="0" * 40),
+                    replace(self.handoff, expected_origin_url="https://wrong.invalid/repo"),
+                    replace(self.handoff, permitted_files=("app.txt",)),
+                    replace(self.handoff, implementer_session_id=_B), replace(self.handoff, reviewer_session_id=None),
+                    replace(self.handoff, reviewed_packet=None), replace(self.handoff, evidence=None),
+                    replace(self.handoff, implementation=replace(self.handoff.implementation, succeeded=False)),
+                    replace(self.handoff, terminal_results=replace(self.handoff.terminal_results, passed=False)),
+                    replace(self.handoff, review=replace(self.handoff.review, approved=False)),
+                    replace(self.handoff, review=replace(self.handoff.review, reviewed_packet_sha256="0" * 64)))
+        before = self.checkpoint_path.read_bytes()
+        for handoff in variants:
+            result = self.publish(handoff=handoff)
+            self.assertFalse(result.published)
+            self.assertEqual(result.outcome, "STOPPED_BEFORE_STAGING")
+            self.assertEqual(self.checkpoint_path.read_bytes(), before)
+        self.assert_no_mutations()
+
+    def test_multi_task_plan_rejected_before_git_mutation(self):
+        second = deepcopy(self.plan["tasks"][0])
+        second.update(task_id="task-2", order=2, depends_on=["task-1"])
+        self.plan["tasks"].append(second)
+        self.frozen_path.unlink()
+        self.approval = plan_fingerprint(self.plan)
+        freeze_approved_plan(self.plan, self.approval, self.frozen_path)
+        result = self.publish()
+        self.assertEqual(result.error_code, "SINGLE_TASK_BATCH_REQUIRED")
+        self.assert_no_mutations()
+
+    def test_modified_frozen_plan_or_wrong_approval_prevents_staging(self):
+        self.assertFalse(self.publish(approved_sha256="0" * 64).published)
+        self.frozen_path.write_bytes(b"{corrupt}")
+        self.assertFalse(self.publish().published)
+        self.assert_no_mutations()
+
+    def test_wrong_checkpoint_identity_or_sessions_prevent_staging(self):
+        original = load_checkpoint(self.checkpoint_path)
+        for change in ({"batch_id": "other"}, {"frozen_plan_sha256": "0" * 64},
+                       {"reviewer_session_id": "33333333-3333-4333-8333-333333333333"}, {"stage": "review"}):
+            self.checkpoint_path.write_text(json.dumps(dict(original, **change)), encoding="utf-8")
+            result = self.publish()
+            self.assertFalse(result.published)
+            self.assertEqual(result.error_code, "CHECKPOINT_HANDOFF_MISMATCH")
+        self.assert_no_mutations()
+
+    def test_packet_cannot_substitute_frozen_criteria_or_commands(self):
+        raw = json.loads(self.handoff.reviewed_packet)
+        raw["caller_supplied_review_inputs"]["acceptance_criteria"]["items"] = ["replacement criterion"]
+        packet = json.dumps(raw, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode()
+        review = replace(self.handoff.review, reviewed_packet_sha256=hashlib.sha256(packet).hexdigest(),
+                         verdict=replace(self.handoff.review.verdict, checked_requirements=("replacement criterion",)))
+        result = self.publish(handoff=replace(self.handoff, reviewed_packet=packet, review=review))
+        self.assertFalse(result.published)
+        self.assert_no_mutations()
+
+    def test_unreviewed_worktree_changes_fail_real_staging_gate(self):
+        (self.repository / "app.txt").write_bytes(b"unreviewed\n")
+        result = self.publish()
+        self.assertEqual(result.outcome, "STAGING_FAILED_OR_UNCERTAIN")
+        self.assertEqual(result.stage, "staging")
+        self.assertEqual(len(self.stage_calls), 1)
+        self.assertEqual(self.publish_calls, [])
+        self.assertEqual(self.git("rev-parse", "HEAD").decode().strip(), self.head)
+        self.assertEqual(load_checkpoint(self.checkpoint_path)["status"], "stopped")
+        self.assertFalse(self.report()["tasks"][0]["staging"]["passed"])
+        publishing = self.report()["tasks"][0]["publishing"]
+        self.assertEqual(publishing["outcome"], "NOT_ATTEMPTED")
+        self.assertFalse(publishing["commit_attempted"])
+        self.assertFalse(publishing["push_attempted"])
+
+    def test_preexisting_index_changes_are_preserved_without_commit(self):
+        self.git("add", "--", "app.txt")
+        before = self.git("diff", "--cached", "--binary")
+        result = self.publish()
+        self.assertFalse(result.published)
+        self.assertEqual(self.publish_calls, [])
+        self.assertEqual(self.git("diff", "--cached", "--binary"), before)
+
+    def test_failed_stage_does_not_call_commit_gate(self):
+        with patch("auto_coding.orchestrator.stage_reviewed_changes", return_value=GitStageResult(False, "GIT_TIMEOUT")):
+            result = orchestrator.publish_single_task_batch(self.handoff, self.frozen_path, self.approval, 5,
+                                                            100_000, 200_000, 200_000, self.metadata, "example/project")
+        self.assertEqual(result.outcome, "STAGING_FAILED_OR_UNCERTAIN")
+        self.assertEqual(result.error_code, "GIT_TIMEOUT")
+        self.assertEqual(self.git("rev-parse", "HEAD").decode().strip(), self.head)
+        self.assertFalse(result.publishing_invoked)
+
+    def failure_query(self, action, *, after_actual=False):
+        original = git_publish._git_query
+        calls = []
+        def query(repository, arguments, *args, **kwargs):
+            calls.append(arguments)
+            if arguments[0] == action:
+                if after_actual:
+                    code, output, error = original(repository, arguments, *args, **kwargs)
+                    self.assertEqual((code, error), (0, None))
+                    return None, None, "GIT_TIMEOUT"
+                return 1, b"", None
+            return original(repository, arguments, *args, **kwargs)
+        return query, calls
+
+    def test_commit_failure_preserves_index_and_stops_without_push(self):
+        query, calls = self.failure_query("commit")
+        with patch("auto_coding.git_publish._git_query", side_effect=query):
+            result = self.publish()
+        self.assertEqual(result.outcome, "COMMIT_FAILED_OR_AMBIGUOUS")
+        self.assertFalse(result.published)
+        self.assertIsNone(result.commit_sha)
+        self.assertFalse(any(args[0] == "push" for args in calls))
+        self.assertEqual(self.git("diff", "--cached", "--name-only").splitlines(), [b"app.txt", b"new.bin"])
+        self.assertEqual(self.report()["tasks"][0]["publishing"]["outcome"], "COMMIT_FAILED_OR_AMBIGUOUS")
+
+    def test_ambiguous_commit_is_not_pushed_or_retried(self):
+        query, calls = self.failure_query("commit", after_actual=True)
+        with patch("auto_coding.git_publish._git_query", side_effect=query):
+            result = self.publish()
+        self.assertEqual(result.outcome, "COMMIT_FAILED_OR_AMBIGUOUS")
+        self.assertIsNone(result.commit_sha)
+        self.assertNotEqual(self.git("rev-parse", "HEAD").decode().strip(), self.head)
+        self.assertEqual(sum(args[0] == "commit" for args in calls), 1)
+        self.assertFalse(any(args[0] == "push" for args in calls))
+
+    def test_created_but_unverified_commit_is_not_pushed(self):
+        original = git_publish._git_query
+        calls = []
+        def query(repository, arguments, *args, **kwargs):
+            calls.append(arguments)
+            code, output, error = original(repository, arguments, *args, **kwargs)
+            if arguments[0] == "--no-replace-objects":
+                output = b"tree " + b"0" * 40 + output[45:]
+            return code, output, error
+        with patch("auto_coding.git_publish._git_query", side_effect=query):
+            result = self.publish()
+        self.assertEqual(result.outcome, "COMMIT_CREATED_NOT_PUSHED")
+        self.assertIsNone(result.commit_sha)
+        self.assertIsNotNone(result.publishing.observed_head_sha)
+        self.assertFalse(any(args[0] == "push" for args in calls))
+
+    def test_push_failure_preserves_verified_local_commit_and_stopped_report(self):
+        query, calls = self.failure_query("push")
+        with patch("auto_coding.git_publish._git_query", side_effect=query):
+            result = self.publish()
+        self.assertEqual(result.outcome, "PUSH_FAILED_OR_AMBIGUOUS")
+        self.assertFalse(result.published)
+        self.assertEqual(result.commit_sha, self.git("rev-parse", "HEAD").decode().strip())
+        self.assertEqual(self.remote_head(), self.head)
+        self.assertEqual(sum(args[0] == "push" for args in calls), 1)
+        self.assertEqual(self.report()["checkpoint"]["status"], "stopped")
+        self.assertEqual(self.report()["tasks"][0]["publishing"]["remote_verification"], "not_confirmed")
+
+    def test_push_timeout_after_actual_remote_update_remains_ambiguous(self):
+        query, calls = self.failure_query("push", after_actual=True)
+        with patch("auto_coding.git_publish._git_query", side_effect=query):
+            result = self.publish()
+        self.assertEqual(result.outcome, "PUSH_FAILED_OR_AMBIGUOUS")
+        self.assertFalse(result.published)
+        self.assertIsNone(result.remote_sha)
+        self.assertEqual(self.remote_head(), result.commit_sha)
+        self.assertEqual(sum(args[0] == "push" for args in calls), 1)
+        self.assertEqual(load_checkpoint(self.checkpoint_path)["status"], "stopped")
+
+    def test_checkpoint_failure_before_staging_prevents_all_git_mutations(self):
+        with patch("auto_coding.orchestrator.update_checkpoint", side_effect=OSError("private")) as update:
+            result = self.publish()
+        self.assertEqual(result.outcome, "STOPPED_BEFORE_STAGING")
+        self.assertEqual(result.checkpoint_error_code, "CHECKPOINT_WRITE_FAILED")
+        self.assertEqual(update.call_count, 1)
+        self.assert_no_mutations()
+
+    def test_checkpoint_failure_after_staging_prevents_commit(self):
+        def update(path, state, **kwargs):
+            if state["status"] == "running" and state["stage"] == "publishing":
+                raise OSError("private")
+            return update_checkpoint(path, state, **kwargs)
+        with patch("auto_coding.orchestrator.update_checkpoint", side_effect=update):
+            result = self.publish()
+        self.assertEqual(result.outcome, "STOPPED_AFTER_STAGING")
+        self.assertFalse(result.published)
+        self.assertEqual(self.publish_calls, [])
+        self.assertTrue(self.git("diff", "--cached", "--name-only"))
+
+    def test_verified_publication_survives_checkpoint_finalization_failure(self):
+        completions = []
+        def update(path, state, **kwargs):
+            if state["status"] == "completed":
+                completions.append(kwargs)
+                raise OSError("private finalization failure")
+            self.assertFalse(kwargs["completion_verified"])
+            return update_checkpoint(path, state, **kwargs)
+        with patch("auto_coding.orchestrator.update_checkpoint", side_effect=update):
+            result = self.publish()
+        self.assertTrue(result.published)
+        self.assertEqual(result.outcome, "PUBLISHED_CHECKPOINT_FAILED")
+        self.assertEqual(completions, [{"completion_verified": True}])
+        self.assertEqual(result.commit_sha, self.remote_head())
+        self.assertEqual(len(self.publish_calls), 1)
+        self.assertFalse(result.checkpoint_finalized)
+        self.assertEqual(result.report_error_code, "REPORT_CHECKPOINT_NOT_TERMINAL")
+
+    def test_actual_report_export_failure_preserves_verified_push_and_completed_checkpoint(self):
+        link = os.link
+        calls = 0
+        def fail_second(source, destination):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("private export failure")
+            link(source, destination)
+        with patch("auto_coding.batch_report.os.link", side_effect=fail_second):
+            result = self.publish()
+        self.assertTrue(result.published)
+        self.assertEqual(result.outcome, "PUBLISHED_REPORT_FAILED")
+        self.assertEqual(result.report_error_code, "REPORT_EXPORT_FAILED")
+        self.assertEqual(result.commit_sha, self.remote_head())
+        self.assertEqual(load_checkpoint(self.checkpoint_path)["status"], "completed")
+        self.assertEqual(list(self.metadata.iterdir()), [])
+        self.assertEqual(len(self.publish_calls), 1)
+
+    def test_partial_report_paths_are_preserved_without_hiding_publication(self):
+        partial = self.metadata / "batch-report.json"
+        def export(*args, **kwargs):
+            partial.write_bytes(b"partial controlled export")
+            raise ReportExportError((partial,))
+        with patch("auto_coding.orchestrator.export_batch_report", side_effect=export):
+            result = self.publish()
+        self.assertTrue(result.published)
+        self.assertEqual(result.partial_report_paths, (partial,))
+        self.assertEqual(result.outcome, "PUBLISHED_REPORT_FAILED")
+
+    def test_interrupted_report_export_preserves_verified_publication(self):
+        with patch("auto_coding.orchestrator.export_batch_report", side_effect=KeyboardInterrupt):
+            result = self.publish()
+        self.assertTrue(result.published)
+        self.assertEqual(result.outcome, "PUBLISHED_REPORT_FAILED")
+        self.assertEqual(result.report_error_code, "REPORT_EXPORT_INTERRUPTED")
+        self.assertEqual(result.commit_sha, self.remote_head())
+        self.assertEqual(load_checkpoint(self.checkpoint_path)["status"], "completed")
+        self.assertEqual(len(self.publish_calls), 1)
+
+    def existing_report(self, name):
+        path = self.metadata / name
+        path.write_bytes(b"existing report")
+        result = self.publish()
+        self.assertEqual(result.error_code, "REPORTS_ALREADY_EXIST")
+        self.assertEqual(path.read_bytes(), b"existing report")
+        self.assert_no_mutations()
+
+    def test_existing_json_report_blocks_staging(self):
+        self.existing_report("batch-report.json")
+
+    def test_existing_markdown_report_blocks_staging(self):
+        self.existing_report("batch-report.md")
+
+    def test_report_directory_inside_target_blocks_staging(self):
+        inside = self.repository / "metadata"
+        inside.mkdir()
+        result = self.publish(metadata_directory=inside)
+        self.assertEqual(result.error_code, "UNSAFE_REPORT_LOCATION")
+        self.assertEqual(list(inside.iterdir()), [])
+        self.assert_no_mutations()
+
+    def test_secondary_reporting_failure_does_not_hide_original_publish_failure(self):
+        query, calls = self.failure_query("push")
+        with patch("auto_coding.git_publish._git_query", side_effect=query), \
+             patch("auto_coding.orchestrator.export_batch_report", side_effect=ReportExportError()):
+            result = self.publish()
+        self.assertEqual(result.outcome, "PUSH_FAILED_OR_AMBIGUOUS")
+        self.assertEqual(result.error_code, "GIT_FAILED")
+        self.assertEqual(result.report_error_code, "REPORT_EXPORT_FAILED")
+        self.assertEqual(result.stage, "publishing")
+
+    def test_no_force_reset_merge_or_extra_gate_attempts(self):
+        original = git_publish._git_query
+        arguments_seen = []
+        def query(repository, arguments, *args, **kwargs):
+            arguments_seen.append(arguments)
+            self.assertFalse(any(value in arguments for value in ("--force", "-f", "reset", "merge", "checkout", "--amend")))
+            return original(repository, arguments, *args, **kwargs)
+        with patch("auto_coding.git_publish._git_query", side_effect=query):
+            result = self.publish()
+        self.assertTrue(result.published, result)
+        self.assertEqual(sum(args[0] == "commit" for args in arguments_seen), 1)
+        self.assertEqual(sum(args[0] == "push" for args in arguments_seen), 1)
+        self.assertEqual(self.publish_calls[0][0][-1], "auto-coding: task-1")
+
+    def test_invalid_timeout_and_limits_prevent_staging(self):
+        for changes in ({"git_timeout_seconds": 0}, {"git_timeout_seconds": 10**1000},
+                        {"git_timeout_seconds": True}, {"evidence_max_bytes": 0},
+                        {"packet_max_bytes": False}, {"report_max_bytes": -1}):
+            result = self.publish(**changes)
+            self.assertFalse(result.published)
+            self.assertIn(result.error_code, ("INVALID_TIMEOUT", "INVALID_MAX_BYTES"))
+        self.assert_no_mutations()
+
+    def test_malformed_checkpoint_is_rejected_without_overwrite(self):
+        self.checkpoint_path.write_bytes(b"{incomplete checkpoint")
+        result = self.publish()
+        self.assertEqual(result.error_code, "CHECKPOINT_INVALID")
+        self.assertEqual(self.checkpoint_path.read_bytes(), b"{incomplete checkpoint")
+        self.assert_no_mutations()
+
+    def test_fabricated_successful_stage_flag_cannot_bypass_d13_index_verification(self):
+        fabricated = GitStageResult(True, None, True, self.handoff.evidence.changed_paths, "0" * 64)
+        with patch("auto_coding.orchestrator.stage_reviewed_changes", return_value=fabricated), \
+             patch("auto_coding.orchestrator.publish_reviewed_changes", wraps=publish_reviewed_changes) as publish:
+            result = orchestrator.publish_single_task_batch(self.handoff, self.frozen_path, self.approval, 5,
+                                                            100_000, 200_000, 200_000, self.metadata, "example/project")
+        self.assertFalse(result.published)
+        self.assertEqual(publish.call_count, 1)
+        self.assertFalse(result.publishing.commit_attempted)
+        self.assertEqual(self.git("rev-parse", "HEAD").decode().strip(), self.head)
+        self.assertEqual(self.git("diff", "--cached", "--name-only"), b"")
 
 
 if __name__ == "__main__":
