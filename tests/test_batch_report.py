@@ -90,6 +90,23 @@ def stopped_task():
     return result
 
 
+def descriptive_stopped_review(decision="UNCERTAIN"):
+    """Reported live failure pattern; descriptions are not verbatim criteria."""
+    record = stopped_task()
+    record["acceptance_criteria"] = ["Approved file bytes are exact.", "Approved tests pass.", "Only approved files change."]
+    record["review"]["model_verdict"] = {
+        "decision": decision,
+        "blocking_issues": ["Independent confirmation of the file bytes remains unavailable"],
+        "nonblocking_notes": ["Inspect <source> before any later approval"],
+        "checked_requirements": ["Compared the proof file with the requested content",
+                                 "Inspected the reported terminal test success",
+                                 "Examined the changed file scope"],
+        "model_reported_confidence": "MEDIUM",
+    }
+    record["review"].update(reviewed_packet_sha256=None, reviewed_evidence_fingerprint=None)
+    return record
+
+
 def pending_task(task_id="task-1"):
     result = task(task_id)
     result.update(status="pending", implementation_started=None, review_started=False,
@@ -133,6 +150,57 @@ class BatchReportTests(unittest.TestCase):
         self.assertEqual(data["tasks"][0]["preserved_evidence_location"], "metadata/evidence-1")
         self.assertIsNone(data["tasks"][0]["publishing"])
         self.assertIn(b"REVIEW\\_REJECTED", report.markdown_bytes)
+
+    def test_nonapproved_review_descriptions_preserve_all_findings(self):
+        for decision in ("UNCERTAIN", "REJECTED"):
+            with self.subTest(decision=decision):
+                record = descriptive_stopped_review(decision)
+                original = deepcopy(record)
+                data = json.loads(self.build([record], checkpoint("stopped")).json_bytes)
+                self.assertEqual(data["tasks"][0], original)
+                self.assertEqual(record, original)
+                self.assertFalse(data["tasks"][0]["review"]["approved"])
+                self.assertEqual(data["batch"]["completed_tasks"], 0)
+
+    def test_approved_verdict_still_requires_exact_complete_unique_criteria(self):
+        for accepted in (False, True):
+            for checks in (["Tests pass."], ["Behavior works", "Tests pass."],
+                           ["Behavior is correct.", "Tests pass.", "Tests pass."],
+                           ["Tests pass.", "Tests pass."], []):
+                with self.subTest(accepted=accepted, checks=checks):
+                    record = task() if accepted else stopped_task()
+                    record["review"]["model_verdict"].update(
+                        decision="APPROVED", blocking_issues=[], checked_requirements=checks)
+                    with self.assertRaises(BatchReportError):
+                        self.build([record], checkpoint() if accepted else checkpoint("stopped"))
+
+    def test_nonapproved_descriptions_retain_text_schema_and_size_bounds(self):
+        for decision in ("UNCERTAIN", "REJECTED"):
+            for field in ("checked_requirements", "blocking_issues", "nonblocking_notes"):
+                for invalid in (["x" * 2001], [""], ["bad\x00text"], ["\ud800"], [7], ["x"] * 101):
+                    with self.subTest(decision=decision, field=field, invalid_type=type(invalid[0])):
+                        record = descriptive_stopped_review(decision)
+                        record["review"]["model_verdict"][field] = invalid
+                        with self.assertRaises(BatchReportError):
+                            self.build([record], checkpoint("stopped"))
+            record = descriptive_stopped_review(decision)
+            report = self.build([record], checkpoint("stopped"))
+            size = max(len(report.json_bytes), len(report.markdown_bytes))
+            self.assertEqual(self.build([record], checkpoint("stopped"), limit=size), report)
+            with self.assertRaises(BatchReportError):
+                self.build([record], checkpoint("stopped"), limit=size - 1)
+
+    def test_nonapproved_decision_cannot_be_marked_approved_or_published(self):
+        for decision in ("UNCERTAIN", "REJECTED"):
+            for claim in ("approval", "publication"):
+                record = descriptive_stopped_review(decision)
+                if claim == "approval":
+                    record["review"]["approved"] = True
+                else:
+                    completed = task()
+                    record.update(staging=completed["staging"], publishing=completed["publishing"])
+                with self.subTest(decision=decision, claim=claim), self.assertRaises(BatchReportError):
+                    self.build([record], checkpoint("stopped"))
 
     def test_multiple_tasks_preserve_supplied_approved_order(self):
         report = self.build([task("task-z"), task("task-a")])
@@ -396,6 +464,31 @@ class BatchReportExportTests(unittest.TestCase):
         self.assertEqual(set(self.destination.iterdir()), set(paths))
         after = {p.relative_to(self.repository): p.read_bytes() for p in self.repository.rglob("*") if p.is_file()}
         self.assertEqual(before, after)
+
+    def test_uncertain_stopped_review_exports_complete_json_and_escaped_markdown(self):
+        record, state = descriptive_stopped_review(), checkpoint("stopped")
+        expected = build_batch_report(state, batch(), [record], [], _LIMIT)
+        paths = export_batch_report(state, batch(), [record], [], _LIMIT,
+                                    destination=self.destination, repository_directory=self.repository)
+        self.assertEqual(paths[0].read_bytes(), expected.json_bytes)
+        self.assertEqual(paths[1].read_bytes(), expected.markdown_bytes)
+        data = json.loads(paths[0].read_bytes())
+        self.assertEqual(data["checkpoint"], state)
+        self.assertEqual(data["tasks"][0], record)
+        self.assertTrue(data["tasks"][0]["terminal_results"]["passed"])
+        self.assertEqual(data["tasks"][0]["review"]["session_id"], _B)
+        self.assertIsNone(data["tasks"][0]["publishing"])
+        markdown = paths[1].read_text(encoding="utf-8")
+        for text in ("UNCERTAIN", "MEDIUM", *record["review"]["model_verdict"]["blocking_issues"],
+                     *record["review"]["model_verdict"]["checked_requirements"]):
+            self.assertIn(text, markdown)
+        self.assertIn("&lt;source&gt;", markdown)
+        self.assertNotIn("<source>", markdown)
+        with self.assertRaises(ReportExportError):
+            export_batch_report(state, batch(), [record], [], _LIMIT,
+                                destination=self.destination, repository_directory=self.repository)
+        self.assertEqual(paths[0].read_bytes(), expected.json_bytes)
+        self.assertEqual(paths[1].read_bytes(), expected.markdown_bytes)
 
     def test_existing_either_report_is_never_overwritten(self):
         for name in ("batch-report.json", "batch-report.md"):

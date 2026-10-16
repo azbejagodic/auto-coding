@@ -299,8 +299,12 @@ def _check_task(task):
         verdict = review["model_verdict"]
         if review["reviewed_evidence_fingerprint"] is not None:
             _require(evidence is not None and review["reviewed_evidence_fingerprint"] == evidence["fingerprint"])
-        if verdict:
-            _require(set(verdict["checked_requirements"]) <= set(criteria))
+        if verdict and verdict["decision"] == "APPROVED":
+            # Negative/uncertain findings may describe checks in the model's
+            # own words. An approval still requires exact, complete coverage,
+            # even when the adapter did not accept that model verdict.
+            _require(len(verdict["checked_requirements"]) == len(criteria)
+                     and set(verdict["checked_requirements"]) == set(criteria))
         if review["approved"]:
             _require(_successful_process(review) and review["error_code"] is None and verdict is not None)
             _require(verdict["decision"] == "APPROVED" and not verdict["blocking_issues"])

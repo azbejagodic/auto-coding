@@ -901,6 +901,67 @@ class StoppedBatchReportTests(unittest.TestCase):
         self.assertEqual(self.git("rev-parse", "HEAD").decode().strip(), self.head)
         self.assertEqual(self.git("status", "--porcelain"), b"")
 
+    def test_uncertain_review_with_three_descriptive_checks_exports_without_publication(self):
+        # Reproduce the live failure pattern entirely in this disposable fixture.
+        # These descriptions model the reported shape, not a saved live transcript.
+        task = self.plan["tasks"][0]
+        task.update(permitted_files=["proof.txt"], acceptance_criteria=[
+            "proof.txt contains the approved bytes.", "The approved test succeeds.", "Only proof.txt changes."])
+        self.frozen_path.unlink()
+        self.approval = plan_fingerprint(self.plan)
+        freeze_approved_plan(self.plan, self.approval, self.frozen_path)
+        proof = b"Stopped review reporting regression\n"
+        verdict = ReviewVerdict(
+            "UNCERTAIN", ("Independent confirmation of the proof bytes remains unavailable",),
+            ("The terminal result reports success",),
+            ("Compared the proof file with the requested content",
+             "Inspected the reported terminal test success", "Examined the changed file scope"), "MEDIUM")
+
+        def implement(*args, **kwargs):
+            (self.repository / "proof.txt").write_bytes(proof)
+            return replace(self.a_result, report=replace(self.a_result.report, files_reported=("proof.txt",)))
+
+        def review(*args, **kwargs):
+            return ReviewResult(False, verdict, "REVIEW_NOT_APPROVED", 0, False, "not_needed", _B)
+
+        with patch("auto_coding.orchestrator.stage_reviewed_changes") as stage, \
+             patch("auto_coding.orchestrator.publish_reviewed_changes") as publish:
+            handoff = self.execute(implement=implement, review=review)
+            self.assertEqual(handoff.outcome, "STOPPED")
+            self.assertEqual(handoff.stage, "review")
+            self.assertEqual(handoff.review.verdict, verdict)
+            checkpoint = self.checkpoint_path.read_bytes()
+            state = load_checkpoint(self.checkpoint_path)
+            self.assertEqual((state["status"], state["stage"]), ("stopped", "review"))
+            self.assertEqual((state["implementer_session_id"], state["reviewer_session_id"]), (_A, _B))
+            result = self.export(handoff)
+            stage.assert_not_called()
+            publish.assert_not_called()
+        self.assertTrue(result.reports_exported, result)
+        self.assertIsNone(result.error_code)
+        data = json.loads(result.report_paths[0].read_bytes())
+        recorded = data["tasks"][0]
+        self.assertTrue(recorded["implementation"]["succeeded"])
+        self.assertTrue(recorded["terminal_results"]["passed"])
+        self.assertEqual(recorded["review"]["model_verdict"], {
+            "decision": verdict.decision, "blocking_issues": list(verdict.blocking_issues),
+            "nonblocking_notes": list(verdict.nonblocking_notes),
+            "checked_requirements": list(verdict.checked_requirements), "model_reported_confidence": verdict.confidence})
+        self.assertFalse(recorded["review"]["approved"])
+        self.assertIsNone(recorded["staging"])
+        self.assertIsNone(recorded["publishing"])
+        self.assertEqual(data["batch"]["completed_tasks"], 0)
+        markdown = result.report_paths[1].read_text(encoding="utf-8")
+        for text in (verdict.decision, verdict.confidence, *verdict.blocking_issues,
+                     *verdict.nonblocking_notes, *verdict.checked_requirements):
+            self.assertIn(text, markdown)
+        self.assertEqual(self.checkpoint_path.read_bytes(), checkpoint)
+        self.assertEqual((self.repository / "proof.txt").read_bytes(), proof)
+        self.assertEqual(self.git("rev-parse", "HEAD").decode().strip(), self.head)
+        self.assertEqual(self.git("ls-remote", "origin", f"refs/heads/{self.branch}").decode().split()[0], self.head)
+        self.assertEqual(self.git("diff", "--cached"), b"")
+        self.assertEqual(self.git("status", "--porcelain"), b"?? proof.txt\n")
+
     def test_stop_before_implementation_keeps_pending_task_unavailable(self):
         self.plan["tasks"][0]["review"]["prompt"] = "\ud800"
         self.frozen_path.unlink()
