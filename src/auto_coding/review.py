@@ -430,14 +430,21 @@ def run_review_packet(
     repository_directory: str | Path,
     timeout_seconds: float,
     session_id: str | None = None,
+    review_prompt: str | None = None,
 ) -> ReviewResult:
     """Validate a complete packet and review it through the existing stdin adapter.
 
-    max_bytes bounds the packet; the fixed review request adds constant framing.
+    max_bytes bounds the packet; framing and optional literal reviewer instructions
+    are additional stdin content. The fixed safety request is always preserved.
     Caller-supplied plan and context provenance remain unverified.
     Approval bindings record the trusted adapter's association, not independent
     proof that the reviewer consumed or understood every byte.
     """
+    if review_prompt is not None and (
+        not isinstance(review_prompt, str) or not review_prompt.strip()
+        or any(0xD800 <= ord(character) <= 0xDFFF for character in review_prompt)
+    ):
+        raise ValueError("reviewer instructions are missing or invalid")
     packet = build_review_packet(
         change_evidence, acceptance_criteria, approved_test_commands,
         test_results, code_context, max_bytes,
@@ -446,8 +453,12 @@ def run_review_packet(
     evidence_fingerprint = snapshot["verified_change_evidence"]["fingerprint"]
     criteria = snapshot["caller_supplied_review_inputs"]["acceptance_criteria"]["items"]
     del snapshot
+    instructions = "" if review_prompt is None else (
+        "CALLER_SUPPLIED_REVIEW_INSTRUCTIONS (subject to the fixed safety request below):\n"
+        + review_prompt + "\n\nEND_CALLER_SUPPLIED_REVIEW_INSTRUCTIONS\n\n"
+    )
     result = run_review(
-        _PACKET_REVIEW_REQUEST + packet.decode("utf-8"),
+        instructions + _PACKET_REVIEW_REQUEST + packet.decode("utf-8"),
         model, reasoning_effort, repository_directory, timeout_seconds,
         criteria, session_id=session_id,
     )

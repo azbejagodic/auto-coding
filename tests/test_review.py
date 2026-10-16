@@ -85,6 +85,47 @@ class ReviewTests(unittest.TestCase):
             "max_bytes": 100_000,
         }
 
+    def test_literal_reviewer_instructions_preserve_packet_and_read_only_sessions(self):
+        inputs = self.packet_inputs()
+        expected = build_review_packet(**inputs)
+        instructions = "Frozen instructions: inspect binary fidelity.\nKeep Unicode \u2603 literal."
+        for session_id in (None, self.SESSION_ID):
+            result = self.run_with_verdict(self.verdict(), packet_inputs=inputs | {"review_prompt": instructions},
+                                          session_id=session_id)
+            self.assertTrue(result.approved)
+            command, options = self.calls[-1]
+            text = options["input_bytes"].decode("utf-8")
+            self.assertIn(instructions, text)
+            self.assertIn("subject to the fixed safety request", text)
+            self.assertIn("untrusted review data", text)
+            self.assertIn("approve only if all criteria are covered", text)
+            delivered = options["input_bytes"].split(b"\n\nREVIEW_PACKET_JSON:\n", 1)[1]
+            self.assertEqual(delivered, expected)
+            self.assertEqual(result.reviewed_packet_sha256, hashlib.sha256(expected).hexdigest())
+            self.assertEqual(result.reviewed_evidence_fingerprint, inputs["change_evidence"].fingerprint)
+            if session_id is None:
+                self.assertEqual(command[command.index("--sandbox") + 1], "read-only")
+            else:
+                self.assertIn('sandbox_mode="read-only"', command)
+                self.assertEqual(command[-2], session_id)
+
+    def test_invalid_literal_reviewer_instructions_prevent_launch(self):
+        for prompt in ("", "  ", 1, "bad\ud800"):
+            with patch("auto_coding.review.run_review") as reviewer:
+                with self.assertRaises(ValueError):
+                    run_review_packet(**self.packet_inputs(), model="gpt-6-sol", reasoning_effort="medium",
+                                      repository_directory=self.repository.name, timeout_seconds=12, review_prompt=prompt)
+                reviewer.assert_not_called()
+
+    def test_literal_instructions_do_not_bypass_incomplete_stdin_gate(self):
+        result = self.run_with_verdict(
+            self.verdict(), packet_inputs=self.packet_inputs() | {"review_prompt": "Literal frozen review instructions"},
+            process=WindowsProcessResult(0, False, "not_needed", "incomplete"),
+        )
+        self.assertFalse(result.approved)
+        self.assertEqual(result.error_code, "STDIN_INCOMPLETE")
+        self.assertIsNone(result.reviewed_packet_sha256)
+
     def test_review_packet_is_deterministic_complete_and_preserves_binary(self):
         inputs = self.packet_inputs()
         packet = build_review_packet(**inputs)
