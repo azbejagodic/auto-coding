@@ -31,6 +31,7 @@ from auto_coding.plan_freeze import PlanIntegrityError, load_frozen_plan, plan_f
 from auto_coding.plan_preflight import preflight_frozen_plan, _preflight_verified_plan
 from auto_coding.review import ReviewResult, _evidence_fingerprint, _packet_json_size, build_review_packet, run_review_packet
 from auto_coding.test_runner import TestCommandResult, TestRunResult, _command_identity, run_approved_tests
+from auto_coding.test_protection import check_test_protection
 from auto_coding.operations import TimeoutDiagnostic, show_timeout
 
 
@@ -94,6 +95,7 @@ def _session(value):
 
 
 def _snapshot(repository, plan, task, timeout, max_bytes):
+    _check_test_inputs(repository, task)
     state = check_publish_preflight(repository, plan["expected_branch"], plan["expected_head"],
                                     plan["expected_origin_url"], timeout)
     if not state.passed:
@@ -118,6 +120,13 @@ def _snapshot(repository, plan, task, timeout, max_bytes):
         if not stat.S_ISREG(mode):
             raise _Stop("UNSAFE_PATH")
     return evidence
+
+
+def _check_test_inputs(repository, task):
+    if "test_contract" in task:
+        result = check_test_protection(repository, task["test_contract"], len(task["test_commands"]))
+        if not result.passed:
+            raise _Stop(result.error_code)
 
 
 def _context(repository, plan, evidence, timeout, max_bytes):
@@ -256,6 +265,7 @@ all further execution and is never retried. Ignored files follow Git semantics.
         git_state = {"expected_branch": plan["expected_branch"], "expected_head": starting_head,
                      "expected_origin_url": plan["expected_origin_url"]}
         repository = Path(repository_directory).resolve(strict=True)
+        _check_test_inputs(repository, task)
         requested_destination = Path(checkpoint_path)
         if os.path.lexists(requested_destination):
             raise _Stop("CHECKPOINT_EXISTS")
@@ -285,6 +295,7 @@ all further execution and is never retried. Ignored files follow Git semantics.
         if not isinstance(prompt, str) or not prompt.strip() or any(0xD800 <= ord(c) <= 0xDFFF for c in prompt):
             raise _Stop("REVIEW_INSTRUCTIONS_INVALID")
         phase = "implementation"
+        _check_test_inputs(repository, task)
         persist(status="running", current_task_id=task["task_id"], stage="implementation")
         settings = task["implementation"]
         values["implementation_started"] = True
@@ -313,7 +324,8 @@ all further execution and is never retried. Ignored files follow Git semantics.
         values["evidence"] = _snapshot(repository, git_state, task, git_timeout_seconds, evidence_max_bytes)
         phase = "testing"
         persist(stage="testing")
-        tests = run_approved_tests(repository, task["test_commands"], task["limits"]["test_seconds"])
+        tests = run_approved_tests(repository, task["test_commands"], task["limits"]["test_seconds"],
+                                   **({"test_contract": task["test_contract"]} if "test_contract" in task else {}))
         values["terminal_results"] = tests
         if isinstance(tests, TestRunResult) and isinstance(tests.command_results, tuple):
             for command in tests.command_results:
@@ -430,6 +442,7 @@ def _publication_handoff(handoff, plan, approved_sha256, evidence_limit, packet_
             or not _session(handoff.implementer_session_id) or not _session(handoff.reviewer_session_id)
             or handoff.implementer_session_id.lower() == handoff.reviewer_session_id.lower()):
         raise _Stop("HANDOFF_INVALID")
+    _check_test_inputs(handoff.repository_directory, task)
     implementation = handoff.implementation
     if (not isinstance(implementation, ImplementationOutcome) or implementation.succeeded is not True
             or type(implementation.exit_status) is not int or implementation.exit_status != 0
@@ -517,6 +530,12 @@ def _report_task(handoff, task, checkpoint, staged, publishing, publishing_invok
                                     if verdict is not None else None} if isinstance(review, ReviewResult) else None,
         "staging": None, "publishing": None, "preserved_evidence_location": None,
     }
+    if isinstance(tests, TestRunResult):
+        if tests.diagnostic is not None:
+            record["terminal_results"]["diagnostic"] = tests.diagnostic.record()
+        for observed, projected in zip(tests.command_results, record["terminal_results"]["command_results"]):
+            if observed.diagnostic is not None:
+                projected["diagnostic"] = observed.diagnostic.record()
     if staged is not None:
         record["staging"] = {"passed": staged.passed, "error_code": staged.error_code,
                              "staging_attempted": staged.staging_attempted,

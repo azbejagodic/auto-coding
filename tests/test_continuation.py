@@ -52,6 +52,21 @@ def invoke(arguments):
 
 
 class ContinuationTests(unittest.TestCase):
+    def test_optional_diagnostics_and_new_approved_test_contract_remain_compatible(self):
+        for record in self.records[:2]:
+            record["terminal_results"]["diagnostic"] = {"classification": "PASSED", "reason_code": "APPROVED_TESTS_PASSED", "protocol": None}
+            for command in record["terminal_results"]["command_results"]:
+                command["diagnostic"] = {"classification": "PASSED", "reason_code": "TEST_PASSED", "protocol": None}
+        self.export()
+        for task in self.continued["tasks"]:
+            task["test_contract"] = {"inputs_complete": True, "protected_files": [], "failure_protocols": ["exit-status-v1"]}
+        self.write_plan()
+        before = snapshot(self.repository, self.source_metadata, self.frozen_path)
+        self.assertTrue(self.inspect().safe)
+        prepared = self.prepare(dry_run=True)
+        self.assertIsNone(prepared.error_code, prepared)
+        self.assertEqual(snapshot(self.repository, self.source_metadata, self.frozen_path), before)
+
     git = fixtures.SequentialBatchTests.git
     configure = fixtures.SequentialBatchTests.configure
 

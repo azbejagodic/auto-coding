@@ -27,6 +27,8 @@ from auto_coding.plan_freeze import freeze_approved_plan, plan_fingerprint
 from auto_coding.review import ReviewResult, ReviewVerdict, build_review_packet
 from auto_coding.test_runner import TestCommandResult, TestRunResult, _command_identity
 from auto_coding.operations import TimeoutDiagnostic
+from auto_coding.integrations.windows_process import WindowsProcessResult
+import auto_coding.test_runner as approved_runner
 from test_plans import make_v2_plan
 
 
@@ -35,6 +37,86 @@ _B = "22222222-2222-4222-8222-222222222222"
 
 
 class OrchestratorTests(unittest.TestCase):
+    def freeze_test_contract(self, *, inline=False, single=False):
+        task = self.plan["tasks"][0]
+        task["permitted_files"].remove("deleted.txt")
+        contents = (self.repository / "deleted.txt").read_bytes()
+        task["test_contract"] = {"inputs_complete": True, "failure_protocols": ["exit-status-v1"] * 2,
+            "protected_files": [] if inline else [{"path": "deleted.txt", "size_bytes": len(contents),
+                                                    "sha256": hashlib.sha256(contents).hexdigest()}]}
+        if single:
+            self.plan["tasks"] = [task]
+        self.frozen_path = self.parent / "contract-frozen.json"
+        self.approval = plan_fingerprint(self.plan)
+        freeze_approved_plan(self.plan, self.approval, self.frozen_path)
+
+    def test_protected_input_mismatch_stops_before_codex_a(self):
+        self.freeze_test_contract()
+        # A wrong manifest at a clean Git base exercises the controller hash
+        # check independently of the ordinary dirty-state preflight.
+        task = self.plan["tasks"][0]
+        task["test_contract"]["protected_files"][0]["sha256"] = "0" * 64
+        self.frozen_path = self.parent / "wrong-contract-frozen.json"
+        self.approval = plan_fingerprint(self.plan)
+        freeze_approved_plan(self.plan, self.approval, self.frozen_path)
+        result = self.execute()
+        self.assert_stopped(result, "PROTECTED_TEST_INPUT_CHANGED")
+        self.assertEqual((self.a_calls, self.test_calls, self.b_calls), ([], [], []))
+        self.assertFalse(self.checkpoint_path.exists())
+
+    def test_codex_a_modification_of_protected_input_stops_before_tests(self):
+        self.freeze_test_contract()
+        def mutate(*args, **kwargs):
+            result = self.implement(*args, **kwargs)
+            (self.repository / "deleted.txt").write_bytes(b"tampered\n")
+            return result
+        result = self.execute(implement=mutate)
+        self.assert_stopped(result, "PROTECTED_TEST_INPUT_CHANGED")
+        self.assertEqual((len(self.a_calls), len(self.test_calls), len(self.b_calls)), (1, 0, 0))
+        self.assertEqual(self.git("rev-parse", "HEAD").decode().strip(), self.head)
+
+    def test_protected_input_mutated_during_tests_prevents_review(self):
+        self.freeze_test_contract()
+        def mutate(*args, **kwargs):
+            result = self.run_tests_fake(*args, **kwargs)
+            (self.repository / "deleted.txt").write_bytes(b"tampered\n")
+            return result
+        result = self.execute(tests=mutate)
+        self.assert_stopped(result, "PROTECTED_TEST_INPUT_CHANGED")
+        self.assertEqual((len(self.a_calls), len(self.test_calls), len(self.b_calls)), (1, 1, 0))
+        self.assertEqual(self.test_calls[0][1], {"test_contract": self.plan["tasks"][0]["test_contract"]})
+
+    def test_protected_input_change_after_review_stops_publication_handoff(self):
+        self.freeze_test_contract()
+        def mutate(*args, **kwargs):
+            result = self.review(*args, **kwargs)
+            (self.repository / "deleted.txt").write_bytes(b"tampered\n")
+            return result
+        result = self.execute(review=mutate)
+        self.assert_stopped(result, "PROTECTED_TEST_INPUT_CHANGED")
+        self.assertEqual(self.git("rev-parse", "HEAD").decode().strip(), self.head)
+        self.assertEqual(self.git("ls-remote", "origin", f"refs/heads/{self.branch}").decode().split()[0], self.head)
+
+    def test_approved_inline_contract_stops_once_and_reports_functional_failure(self):
+        self.freeze_test_contract(inline=True, single=True)
+        def tests(*args, **kwargs):
+            self.test_calls.append((args, kwargs))
+            with patch("auto_coding.test_runner.run_windows_process", return_value=WindowsProcessResult(10, False, "not_needed")):
+                return approved_runner.run_approved_tests(*args, **kwargs)
+        result = self.execute(tests=tests)
+        self.assert_stopped(result, "TESTS_NOT_PASSED")
+        self.assertEqual((len(self.a_calls), len(self.test_calls), len(self.b_calls)), (1, 1, 0))
+        self.assertEqual(result.terminal_results.diagnostic.classification, "APPLICATION_FAILURE")
+        metadata = self.parent / "stopped-contract-report"
+        metadata.mkdir()
+        exported = orchestrator.export_stopped_batch_report(result, self.frozen_path, self.approval,
+                                                            metadata, "example/project", 200000)
+        self.assertTrue(exported.reports_exported, exported)
+        record = json.loads(exported.report_paths[0].read_bytes())["tasks"][0]
+        self.assertEqual(record["terminal_results"]["diagnostic"]["reason_code"], "APPROVED_FUNCTIONAL_FAILURE")
+        self.assertIsNone(record["review"])
+        self.assertEqual(self.git("rev-parse", "HEAD").decode().strip(), self.head)
+
     def test_implementation_timeout_has_durable_diagnostic_and_no_later_execution(self):
         def timeout(*args, **kwargs):
             return replace(self.implement(*args, **kwargs), succeeded=False, exit_status=None,
@@ -1082,6 +1164,20 @@ class StoppedBatchReportTests(unittest.TestCase):
 
 
 class SequentialBatchTests(unittest.TestCase):
+    def test_opted_in_contracts_preserve_real_sequential_publication_and_diagnostics(self):
+        for task in self.plan["tasks"]:
+            task["test_contract"] = {"inputs_complete": True, "protected_files": [], "failure_protocols": ["exit-status-v1"]}
+        self.configure(3)
+        def tests(*args, **kwargs):
+            self.test_calls.append((args, kwargs))
+            with patch("auto_coding.test_runner.run_windows_process", return_value=WindowsProcessResult(0, False, "not_needed")):
+                return approved_runner.run_approved_tests(*args, **kwargs)
+        result = self.run_batch(tests=tests)
+        self.assert_success(result, 3)
+        for index, record in enumerate(self.data()["tasks"]):
+            self.assertEqual(self.test_calls[index][1], {"test_contract": self.plan["tasks"][index]["test_contract"]})
+            self.assertEqual(record["terminal_results"]["diagnostic"]["classification"], "PASSED")
+
     git = OrchestratorTests.git
     run_tests_fake = OrchestratorTests.run_tests_fake
 
@@ -1183,7 +1279,8 @@ class SequentialBatchTests(unittest.TestCase):
         for index, task in enumerate(self.plan["tasks"]):
             self.assertEqual(self.a_calls[index], ((task["implementation"]["prompt"], task["implementation"]["model"],
                              task["implementation"]["reasoning_effort"], self.repository, task["limits"]["implementation_seconds"]), {"session_id": None}))
-            self.assertEqual(self.test_calls[index], ((self.repository, task["test_commands"], task["limits"]["test_seconds"]), {}))
+            expected_options = {"test_contract": task["test_contract"]} if "test_contract" in task else {}
+            self.assertEqual(self.test_calls[index], ((self.repository, task["test_commands"], task["limits"]["test_seconds"]), expected_options))
             args, options = self.b_calls[index]
             self.assertEqual(args[1:3], (task["acceptance_criteria"], task["test_commands"]))
             self.assertEqual(options["review_prompt"], task["review"]["prompt"])

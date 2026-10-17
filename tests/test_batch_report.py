@@ -118,6 +118,72 @@ def pending_task(task_id="task-1"):
 
 
 class BatchReportTests(unittest.TestCase):
+    def test_fixed_test_diagnostics_export_without_raw_text(self):
+        from auto_coding.test_runner import TestDiagnostic
+        for classification, reason, status, protocol in (
+                ("APPLICATION_FAILURE", "APPROVED_FUNCTIONAL_FAILURE", 10, "exit-status-v1"),
+                ("INFRASTRUCTURE_FAILURE", "APPROVED_INFRASTRUCTURE_FAILURE", 20, "exit-status-v1"),
+                ("INFRASTRUCTURE_FAILURE", "PROTECTED_TEST_INPUT_CHANGED", 0, "exit-status-v1"),
+                ("UNKNOWN", "TEST_PROTOCOL_UNAVAILABLE", 1, None)):
+            with self.subTest(classification=classification, reason=reason):
+                state = dict(checkpoint("stopped"), stage="testing", reviewer_session_id=None, stop_reason_code="TESTS_NOT_PASSED")
+                record = stopped_task()
+                record.update(failure_stage="testing", stop_reason_code="TESTS_NOT_PASSED", review=None, review_started=False)
+                record["reviewer"].update(session_id=None, session_mode=None)
+                terminal = record["terminal_results"]
+                terminal.update(passed=False, first_failed_index=1)
+                terminal["command_results"][0]["exit_status"] = status
+                terminal["diagnostic"] = TestDiagnostic(classification, reason, protocol).record()
+                terminal["command_results"][0]["diagnostic"] = terminal["diagnostic"]
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    repository, metadata = root / "target", root / "metadata"
+                    repository.mkdir()
+                    metadata.mkdir()
+                    paths = export_batch_report(state, batch(), [record], [], _LIMIT,
+                                                destination=metadata, repository_directory=repository)
+                    observed = json.loads(paths[0].read_bytes())["tasks"][0]["terminal_results"]
+                    self.assertEqual(observed["diagnostic"], terminal["diagnostic"])
+                    self.assertIn(classification.replace("_", r"\_"), paths[1].read_text(encoding="utf-8"))
+
+    def test_successful_and_legacy_report_semantics_remain_unchanged(self):
+        original = self.build()
+        self.assertNotIn(b'"diagnostic"', original.json_bytes)
+        record = task()
+        record["terminal_results"]["command_results"][0]["diagnostic"] = {
+            "classification": "PASSED", "reason_code": "TEST_PASSED", "protocol": "exit-status-v1"}
+        record["terminal_results"]["diagnostic"] = {
+            "classification": "PASSED", "reason_code": "APPROVED_TESTS_PASSED", "protocol": None}
+        data = json.loads(self.build([record]).json_bytes)
+        self.assertEqual(data["batch"]["completed_tasks"], 1)
+        self.assertTrue(data["tasks"][0]["terminal_results"]["passed"])
+        report = self.build([record])
+        exact = max(len(report.json_bytes), len(report.markdown_bytes))
+        self.assertEqual(self.build([record], limit=exact), report)
+        with self.assertRaises(BatchReportError):
+            self.build([record], limit=exact - 1)
+
+    def test_diagnostic_spoofing_inconsistency_and_unbounded_fields_are_rejected(self):
+        valid = {"classification": "PASSED", "reason_code": "TEST_PASSED", "protocol": "exit-status-v1"}
+        for diagnostic in (dict(valid, classification="APPLICATION_FAILURE"), dict(valid, reason_code="PRIVATE_SECRET"),
+                           dict(valid, raw_stderr="AssertionError"), dict(valid, protocol="x" * 10000)):
+            record = task()
+            record["terminal_results"]["command_results"][0]["diagnostic"] = diagnostic
+            with self.assertRaises(BatchReportError):
+                self.build([record])
+
+    def test_prelaunch_protection_failure_does_not_invent_test_execution(self):
+        record = stopped_task()
+        record.update(failure_stage="testing", stop_reason_code="TESTS_NOT_PASSED", review=None, review_started=False)
+        record["reviewer"].update(session_id=None, session_mode=None)
+        record["terminal_results"] = {"passed": False, "commands_executed": 0, "first_failed_index": None,
+                                      "command_results": [], "diagnostic": {"classification": "INFRASTRUCTURE_FAILURE",
+                                      "reason_code": "PROTECTED_TEST_INPUT_CHANGED", "protocol": "exit-status-v1"}}
+        state = dict(checkpoint("stopped"), stage="testing", reviewer_session_id=None, stop_reason_code="TESTS_NOT_PASSED")
+        data = json.loads(self.build([record], state).json_bytes)
+        self.assertEqual(data["tasks"][0]["terminal_results"]["commands_executed"], 0)
+        self.assertIsNone(data["tasks"][0]["review"])
+
     def test_stopped_timeout_exports_json_and_markdown_with_actual_observations(self):
         detail = TimeoutDiagnostic("review", 600, 601.25).record()
         state = dict(checkpoint("stopped"), stop_reason_code="PROCESS_TIMEOUT", timeout=detail)

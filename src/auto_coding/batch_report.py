@@ -146,14 +146,25 @@ _IMPLEMENTATION = {
         "model_reported_confidence": _CONFIDENCE, "concerns": _array(_text),
     }),
 }
-_TERMINAL = {
+_DIAGNOSTIC = {
+    "classification": _enum("PASSED", "APPLICATION_FAILURE", "TIMEOUT", "LAUNCH_FAILURE",
+                            "CLEANUP_FAILURE", "INFRASTRUCTURE_FAILURE", "UNKNOWN"),
+    "reason_code": _enum("TEST_PASSED", "APPROVED_TESTS_PASSED", "APPROVED_FUNCTIONAL_FAILURE",
+                         "APPROVED_INFRASTRUCTURE_FAILURE", "TEST_TIMEOUT", "TEST_LAUNCH_FAILED",
+                         "TEST_CLEANUP_UNCERTAIN", "TEST_RESULT_INVALID", "UNRECOGNIZED_EXIT_STATUS",
+                         "TEST_PROTOCOL_UNAVAILABLE", "TEST_CONTRACT_INVALID",
+                         "PROTECTED_TEST_INPUT_UNSAFE", "PROTECTED_TEST_INPUT_CHANGED",
+                         "PROTECTED_TEST_INPUT_UNAVAILABLE"),
+    "protocol": _optional(_enum("opaque", "exit-status-v1")),
+}
+_TERMINAL = ("record", {
     "passed": _boolean, "commands_executed": _integer, "first_failed_index": _optional(_integer),
-    "command_results": _array({
+    "command_results": _array(("record", {
         "index": _integer, "command_identity": _SHA256,
         "exit_status": _optional(_integer), "elapsed_seconds": _duration,
         "timed_out": _boolean, "cleanup_result": _CLEANUP,
-    }),
-}
+    }, {"diagnostic": _DIAGNOSTIC})),
+}, {"diagnostic": _DIAGNOSTIC})
 _REVIEW = {
     "approved": _boolean, "exit_status": _optional(_integer), "timed_out": _boolean,
     "cleanup_result": _CLEANUP, "error_code": _optional(_REASON),
@@ -224,6 +235,12 @@ def _copy(value, schema, budget):
             budget.charge(4)
             return None
         return _copy(value, schema[1], budget)
+    if isinstance(schema, tuple) and schema[0] == "record":
+        required, optional = schema[1:]
+        if (not isinstance(value, dict) or not required.keys() <= value.keys()
+                or not value.keys() <= required.keys() | optional.keys()):
+            raise BatchReportError("invalid report record fields")
+        schema = dict(required, **{key: child for key, child in optional.items() if key in value})
     if isinstance(schema, dict):
         if not isinstance(value, dict) or value.keys() != schema.keys():
             raise BatchReportError("invalid report record fields")
@@ -254,6 +271,22 @@ def _require(condition):
 
 def _successful_process(result):
     return result["exit_status"] == 0 and not result["timed_out"] and result["cleanup_result"] == "not_needed"
+
+
+def _check_test_diagnostic(result):
+    diagnostic = result.get("diagnostic")
+    if diagnostic is None:
+        return _successful_process(result)  # Legacy records retain their contract.
+    # Recompute the fixed classification; raw output and free text never enter
+    # this schema. Protection errors are explicit controller observations.
+    from types import SimpleNamespace
+    from auto_coding.test_runner import _diagnose
+    reason = diagnostic["reason_code"]
+    protection_error = reason if reason.startswith("PROTECTED_TEST_") or reason == "TEST_CONTRACT_INVALID" else None
+    expected = _diagnose(SimpleNamespace(**{key: result[key] for key in ("exit_status", "timed_out", "cleanup_result")}),
+                         diagnostic["protocol"], protection_error)
+    _require(diagnostic == expected.record())
+    return diagnostic["classification"] == "PASSED"
 
 
 def _check_task(task):
@@ -290,11 +323,21 @@ def _check_task(task):
         first_failure = None
         for index, result in enumerate(commands, 1):
             _require(result["index"] == index and result["command_identity"] == approved[index - 1])
-            if not _successful_process(result):
+            if not _check_test_diagnostic(result):
                 _require(first_failure is None and index == len(commands))
                 first_failure = index
         _require(terminal["first_failed_index"] == first_failure)
         _require(terminal["passed"] == (bool(approved) and len(commands) == len(approved) and first_failure is None))
+        diagnostic = terminal.get("diagnostic")
+        if diagnostic is not None:
+            if terminal["passed"]:
+                _require(diagnostic == {"classification": "PASSED", "reason_code": "APPROVED_TESTS_PASSED", "protocol": None})
+            elif first_failure is not None:
+                _require(diagnostic == commands[-1].get("diagnostic"))
+            else:
+                _require(len(commands) < len(approved) and diagnostic["classification"] == "INFRASTRUCTURE_FAILURE"
+                         and (diagnostic["reason_code"].startswith("PROTECTED_TEST_")
+                              or diagnostic["reason_code"] == "TEST_CONTRACT_INVALID"))
     review = task["review"]
     if review:
         verdict = review["model_verdict"]

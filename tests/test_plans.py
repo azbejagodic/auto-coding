@@ -207,6 +207,74 @@ class PlanValidationTests(unittest.TestCase):
 
 
 class PlanVersionTwoTests(unittest.TestCase):
+    def test_optional_test_contract_is_approval_bound_and_legacy_unchanged(self):
+        plan = make_v2_plan()
+        legacy = deepcopy(plan)
+        original = plan_fingerprint(plan)
+        self.assertNotIn("test_contract", validate_plan(plan)["tasks"][0])
+        contract = {"inputs_complete": True, "protected_files": [], "failure_protocols": ["exit-status-v1"]}
+        plan["tasks"][0]["test_contract"] = contract
+        self.assertEqual(validate_plan(plan)["tasks"][0]["test_contract"], contract)
+        self.assertNotEqual(plan_fingerprint(plan), original)
+        changed = deepcopy(plan)
+        changed["tasks"][0]["test_contract"]["failure_protocols"] = ["opaque"]
+        self.assertNotEqual(plan_fingerprint(changed), plan_fingerprint(plan))
+        self.assertEqual(plan_fingerprint(legacy), original)
+
+    def test_protected_test_contract_rejects_permitted_path_conflicts(self):
+        for protected, permitted in (("tests/check.py", "tests/check.py"), ("Tests/check.py", "tests/CHECK.py"),
+                                      ("tests/check.py", "tests"), ("tests", "tests/check.py")):
+            with self.subTest(protected=protected, permitted=permitted):
+                plan = make_v2_plan()
+                plan["tasks"][0].update(permitted_files=[permitted], test_contract={
+                    "inputs_complete": True, "failure_protocols": ["exit-status-v1"],
+                    "protected_files": [{"path": protected, "size_bytes": 3, "sha256": "a" * 64}],
+                })
+                with self.assertRaises(PlanValidationError):
+                    validate_plan(plan)
+
+    def test_protected_manifest_integrity_changes_canonical_approval(self):
+        plan = make_v2_plan()
+        plan["tasks"][0]["test_contract"] = {
+            "inputs_complete": True, "failure_protocols": ["exit-status-v1"],
+            "protected_files": [{"path": "tests/check.py", "size_bytes": 3, "sha256": "a" * 64}],
+        }
+        original = plan_fingerprint(plan)
+        for key, value in (("path", "tests/other.py"), ("size_bytes", 4), ("sha256", "b" * 64)):
+            changed = deepcopy(plan)
+            changed["tasks"][0]["test_contract"]["protected_files"][0][key] = value
+            self.assertNotEqual(plan_fingerprint(changed), original)
+
+    def test_test_contract_count_size_and_duplicate_bounds(self):
+        artifact = {"path": "tests/check.py", "sha256": "a" * 64, "size_bytes": 1}
+        for files in ([dict(artifact, path=f"tests/check-{i}.py") for i in range(101)],
+                      [artifact, dict(artifact, path="Tests/CHECK.py")],
+                      [dict(artifact, size_bytes=64 * 1024 * 1024 + 1)],
+                      [dict(artifact, size_bytes=64 * 1024 * 1024), dict(artifact, path="tests/extra.py")]):
+            with self.subTest(count=len(files)):
+                plan = make_v2_plan()
+                plan["tasks"][0]["test_contract"] = {"inputs_complete": True, "protected_files": files,
+                                                       "failure_protocols": ["exit-status-v1"]}
+                with self.assertRaises(PlanValidationError):
+                    validate_plan(plan)
+
+    def test_invalid_test_contracts_and_v1_extension_fail_closed(self):
+        valid = {"inputs_complete": True, "protected_files": [], "failure_protocols": ["exit-status-v1"]}
+        for value in (None, {}, dict(valid, inputs_complete=False), dict(valid, failure_protocols=[]),
+                      dict(valid, failure_protocols=["guess-stderr"]), dict(valid, extra=True),
+                      dict(valid, protected_files=[{"path": "../escape", "sha256": "a" * 64, "size_bytes": 1}]),
+                      dict(valid, protected_files=[{"path": "test.py", "sha256": "wrong", "size_bytes": 1}]),
+                      dict(valid, protected_files=[{"path": "test.py", "sha256": "a" * 64, "size_bytes": True}])):
+            with self.subTest(value=value):
+                plan = make_v2_plan()
+                plan["tasks"][0]["test_contract"] = value
+                with self.assertRaises(PlanValidationError):
+                    validate_plan(plan)
+        plan = make_plan()
+        plan["tasks"][0]["test_contract"] = valid
+        with self.assertRaises(PlanValidationError):
+            validate_plan(plan)
+
     def test_recommended_execution_timeouts_are_explicit_approved_values(self):
         plan = make_v2_plan()
         plan["tasks"][0]["limits"].update(implementation_seconds=1800, review_seconds=600, test_seconds=1800)

@@ -113,3 +113,67 @@ before invoking Codex. It remains a provenance reference, not approval or a
 signed execution attestation. Changed proposed plans need a fresh preparation.
 Existing checkpoint/report schemas and the normal single/multi-task pipeline
 remain unchanged. Incomplete original audit records require manual investigation.
+
+### Approved test protection and failure classification (D26a)
+
+New schema-v2 tasks may include this optional `test_contract`. It enables no
+repairs or retries. The entire declaration is covered by the plan's canonical
+approved SHA-256; existing plans receive no implicit fields or new approval.
+
+```json
+"test_contract": {
+  "inputs_complete": true,
+  "protected_files": [
+    {
+      "path": "tests/approved_check.py",
+      "size_bytes": 123,
+      "sha256": "<actual lowercase SHA-256 of those exact 123 bytes>"
+    }
+  ],
+  "failure_protocols": ["exit-status-v1"]
+}
+```
+
+There must be one protocol entry per ordered approved test command: `opaque`
+or `exit-status-v1`. `inputs_complete: true` is the approving caller's explicit
+assertion that **all mutable repository test inputs** are listed, including
+harnesses, imports, configuration and fixtures. The controller cannot discover
+that dependency closure for arbitrary commands. An empty `protected_files`
+explicitly declares inline/installed trusted inputs; it does not infer missing
+files from command arguments. Do not declare completeness when it is unknown.
+
+Each declared file must already exist as a regular, unaliased file with the
+approved size and hash at that task's start. Protected paths cannot overlap
+permitted paths, including case aliases or parent/child collisions. There are
+at most 100 artifacts and 64 MiB of declared input bytes per task. Hashing uses
+64 KiB chunks, never raw model claims. The controller checks before Codex A,
+at evidence snapshots, before and after every test command, after review, and
+at publication handoff. A changed, missing or unsafe input stops execution.
+These checks detect persistent modifications; they are snapshots, not an OS
+write-denial mechanism or protection against a hostile concurrent host.
+
+`exit-status-v1` is a protocol for an explicitly trusted, approved test harness:
+
+| Exit status | Meaning |
+| --- | --- |
+| 0 | Test passed |
+| 10 | Harness confirms an application assertion/functional failure |
+| 20 | Harness reports test infrastructure failure |
+| Other nonzero | Unknown failure; ineligible for future automatic repair |
+
+The harness must reserve 10 solely for genuine functional failures and map
+setup/import/environment problems to 20 or an unknown exit. Merely labeling an
+arbitrary tool with this protocol is unsafe. The controller verifies the declared
+artifact bytes and observes process status; it cannot prove that an approved
+harness is honest or that every dependency was declared. Installed interpreters,
+tools, dependencies and the host remain trusted. Inline commands can implement
+the same approved protocol without creating a test file.
+
+Without a contract, or with `opaque`, every nonzero exit is `UNKNOWN`. Timeouts,
+launch failures and uncertain cleanup retain separate nonrepairable diagnostics.
+Protected-input failures are infrastructure failures, even if the command
+exits zero. Stdout and stderr remain discarded: text such as `AssertionError`
+or fabricated diagnostic markers cannot activate classification. Results and
+JSON/Markdown reports contain only bounded fixed diagnostic codes, never raw
+process output. Existing successful execution, review and publication gates
+remain required. D26a adds no repair attempts, counters or continuation behavior.

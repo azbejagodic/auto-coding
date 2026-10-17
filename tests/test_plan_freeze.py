@@ -47,6 +47,19 @@ def make_plan() -> dict:
 
 
 class PlanFreezeTests(unittest.TestCase):
+    def test_v2_test_contract_freeze_requires_original_explicit_approval(self):
+        from test_plans import make_v2_plan
+        plan = make_v2_plan()
+        plan["tasks"][0]["test_contract"] = {"inputs_complete": True, "protected_files": [],
+                                               "failure_protocols": ["exit-status-v1"]}
+        approval = plan_fingerprint(plan)
+        freeze_approved_plan(plan, approval, self.destination)
+        self.assertEqual(load_frozen_plan(self.destination, approval), plan)
+        changed = deepcopy(plan)
+        changed["tasks"][0]["test_contract"]["failure_protocols"] = ["opaque"]
+        with self.assertRaises(PlanIntegrityError):
+            freeze_approved_plan(changed, approval, self.destination.with_name("changed.json"))
+
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
