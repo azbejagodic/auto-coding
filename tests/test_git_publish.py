@@ -549,6 +549,8 @@ class GitStagingTests(unittest.TestCase):
         self.assertEqual(result.error_code, "GIT_TIMEOUT")
         self.assertTrue(result.staging_attempted)
         self.assertEqual(result.staged_paths, ("tracked.txt",))
+        self.assertEqual(result.timeout.operation, "git_staging")
+        self.assertEqual(result.timeout.configured_seconds, 10)
         self.assertEqual(self.staged_paths(), result.staged_paths)
         self.assertEqual(len(self.add_calls), 1)
         self.assertNotIn("private", repr(result))
@@ -879,6 +881,9 @@ class GitPublishingTests(unittest.TestCase):
             result = self.publish()
         self.assertEqual(result.outcome, "COMMIT_FAILED_OR_AMBIGUOUS")
         self.assertEqual(result.error_code, "GIT_TIMEOUT")
+        self.assertEqual(result.timeout.operation, "git_commit")
+        self.assertEqual(result.timeout.configured_seconds, 10)
+        self.assertIsNone(result.timeout.elapsed_seconds)
         self.assertIsNone(result.commit_sha)
         self.assertFalse(result.push_attempted)
         self.assertEqual(commits, 1)
@@ -1016,9 +1021,29 @@ class GitPublishingTests(unittest.TestCase):
             result = self.publish()
         self.assertEqual(result.outcome, "PUSH_FAILED_OR_AMBIGUOUS")
         self.assertEqual(result.error_code, "GIT_TIMEOUT")
+        self.assertEqual(result.timeout.operation, "git_push")
         self.assertIsNone(result.remote_sha)
         self.assertEqual(self.remote_head(), result.commit_sha)
         self.assertEqual(pushes, 1)
+
+    def test_remote_verification_timeout_is_distinct_from_push_timeout(self):
+        original = git_publish._git_query
+        pushes = []
+        def query(repository, arguments, *rest):
+            if pushes and arguments[0] == "ls-remote":
+                return None, None, "GIT_TIMEOUT"
+            result = original(repository, arguments, *rest)
+            if arguments[0] == "push":
+                pushes.append(arguments)
+            return result
+        with patch("auto_coding.git_publish._git_query", side_effect=query):
+            result = self.publish()
+        self.assertEqual(result.outcome, "PUSH_FAILED_OR_AMBIGUOUS")
+        self.assertEqual(result.error_code, "GIT_TIMEOUT")
+        self.assertEqual(result.timeout.operation, "git_verification")
+        self.assertEqual(len(pushes), 1)
+        self.assertIsNone(result.remote_sha)
+        self.assertEqual(self.remote_head(), result.commit_sha)
 
     def test_successful_push_requires_independent_matching_remote_sha(self):
         original = git_publish._git_query

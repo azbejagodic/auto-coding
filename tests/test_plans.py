@@ -207,6 +207,11 @@ class PlanValidationTests(unittest.TestCase):
 
 
 class PlanVersionTwoTests(unittest.TestCase):
+    def test_recommended_execution_timeouts_are_explicit_approved_values(self):
+        plan = make_v2_plan()
+        plan["tasks"][0]["limits"].update(implementation_seconds=1800, review_seconds=600, test_seconds=1800)
+        self.assertEqual(validate_plan(plan), plan)
+
     def test_valid_v2_keeps_exact_commands_and_explicit_timeout(self):
         plan = make_v2_plan()
         plan["tasks"][0]["test_commands"].append(["py", "-m", "compileall", "src"])

@@ -15,6 +15,17 @@ from auto_coding.change_evidence import collect_change_evidence
 
 
 class ChangeEvidenceTests(unittest.TestCase):
+    def test_git_timeout_override_reaches_scope_and_every_evidence_query(self):
+        (self.repository / "tracked.txt").write_bytes(b"changed\n")
+        (self.repository / "new.bin").write_bytes(b"\0\xff")
+        run = subprocess.run
+        with patch("auto_coding.change_evidence.subprocess.run", wraps=run) as execute:
+            result = collect_change_evidence(self.repository, ["tracked.txt", "new.bin"], 100000,
+                                             timeout_seconds=7)
+        self.assertTrue(result.passed, result)
+        self.assertEqual(len(execute.call_args_list), 4)
+        self.assertEqual([call.kwargs["timeout"] for call in execute.call_args_list], [7] * 4)
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)

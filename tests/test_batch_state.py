@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from auto_coding.batch_state import (
     CheckpointError, create_checkpoint, load_checkpoint, update_checkpoint, validate_checkpoint_capacity,
 )
+from auto_coding.operations import TimeoutDiagnostic
 
 
 _A = "11111111-1111-4111-8111-111111111111"
@@ -33,6 +34,31 @@ def initial_state() -> dict:
 
 
 class BatchStateTests(unittest.TestCase):
+    def test_optional_timeout_is_durable_without_changing_legacy_checkpoint(self):
+        self.create()
+        self.assertNotIn("timeout", load_checkpoint(self.path))
+        stopped = dict(self.running(), status="stopped", stop_reason_code="PROCESS_TIMEOUT",
+                       timeout=TimeoutDiagnostic("implementation", 1800, 1801).record())
+        update_checkpoint(self.path, stopped)
+        self.assertEqual(load_checkpoint(self.path), stopped)
+        changed = dict(stopped)
+        del changed["timeout"]
+        with self.assertRaises(CheckpointError):
+            update_checkpoint(self.path, changed)
+        self.assertEqual(load_checkpoint(self.path), stopped)
+
+    def test_invalid_or_nonstopped_timeout_checkpoint_is_rejected(self):
+        detail = TimeoutDiagnostic("implementation", 1800).record()
+        for state in (dict(self.running(), timeout=detail),
+                      dict(self.running(), status="stopped", stop_reason_code="PROCESS_TIMEOUT", timeout=None),
+                      dict(self.running(), status="stopped", stop_reason_code="PROCESS_TIMEOUT",
+                           timeout=dict(detail, private="PRIVATE")),
+                      dict(self.running(), status="stopped", stop_reason_code="PROCESS_TIMEOUT",
+                           timeout=dict(detail, configured_seconds=0))):
+            with self.subTest(state=state), self.assertRaises(CheckpointError):
+                create_checkpoint(self.path, state)
+        self.assertFalse(self.path.exists())
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -334,6 +360,15 @@ class BatchStateTests(unittest.TestCase):
 
 
 class SequentialCheckpointTests(unittest.TestCase):
+    def test_timeout_preserves_prior_verified_publication_and_original_base(self):
+        create_checkpoint(self.path, self.initial)
+        state = dict(self.first_completed(), status="stopped", stop_reason_code="TEST_TIMEOUT", stage="testing",
+                     timeout=TimeoutDiagnostic("tests", 1800, 1800.5).record())
+        update_checkpoint(self.path, state)
+        self.assertEqual(load_checkpoint(self.path), state)
+        self.assertEqual(state["base_head"], self.initial["base_head"])
+        self.assertEqual(state["publications"][0]["task_id"], "task-1")
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)

@@ -16,6 +16,7 @@ from auto_coding.batch_report import (
     BatchReportError, ReportExportError, build_batch_report, export_batch_report,
 )
 from auto_coding.test_runner import _command_identity
+from auto_coding.operations import TimeoutDiagnostic
 
 
 _A = "11111111-1111-4111-8111-111111111111"
@@ -117,6 +118,34 @@ def pending_task(task_id="task-1"):
 
 
 class BatchReportTests(unittest.TestCase):
+    def test_stopped_timeout_exports_json_and_markdown_with_actual_observations(self):
+        detail = TimeoutDiagnostic("review", 600, 601.25).record()
+        state = dict(checkpoint("stopped"), stop_reason_code="PROCESS_TIMEOUT", timeout=detail)
+        record = stopped_task()
+        record.update(stop_reason_code="PROCESS_TIMEOUT", staging=None, publishing=None)
+        record["review"].update(timed_out=True, exit_status=None, error_code="PROCESS_TIMEOUT",
+                                 cleanup_result="parent_not_reaped", model_verdict=None)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository, metadata = root / "repo", root / "metadata"
+            repository.mkdir()
+            metadata.mkdir()
+            paths = export_batch_report(state, batch(), [record], [], _LIMIT,
+                                        destination=metadata, repository_directory=repository)
+            data = json.loads(paths[0].read_bytes())
+            self.assertEqual(data["checkpoint"]["timeout"], detail)
+            self.assertTrue(data["tasks"][0]["review"]["timed_out"])
+            self.assertIsNone(data["tasks"][0]["publishing"])
+            markdown = paths[1].read_text(encoding="utf-8")
+            self.assertIn("STOPPED - TIMEOUT", markdown)
+            self.assertIn("600", markdown)
+            self.assertIn(r"601\.25", markdown)
+
+    def test_timeout_diagnostic_requires_matching_process_evidence(self):
+        state = dict(checkpoint("stopped"), timeout=TimeoutDiagnostic("review", 600).record())
+        with self.assertRaises(BatchReportError):
+            self.build([stopped_task()], state)
+
     def build(self, tasks=None, state=None, metadata=None, events=None, limit=_LIMIT):
         return build_batch_report(checkpoint() if state is None else state, batch() if metadata is None else metadata,
                                   [task()] if tasks is None else tasks, [] if events is None else events, limit)

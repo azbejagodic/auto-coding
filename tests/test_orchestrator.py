@@ -1,8 +1,10 @@
 """First-task integration with fake Codex/test execution and local Git only."""
 
 from copy import deepcopy
+from contextlib import redirect_stderr
 from dataclasses import replace
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -24,6 +26,7 @@ from auto_coding.integrations.codex import ImplementationOutcome, Implementation
 from auto_coding.plan_freeze import freeze_approved_plan, plan_fingerprint
 from auto_coding.review import ReviewResult, ReviewVerdict, build_review_packet
 from auto_coding.test_runner import TestCommandResult, TestRunResult, _command_identity
+from auto_coding.operations import TimeoutDiagnostic
 from test_plans import make_v2_plan
 
 
@@ -32,6 +35,58 @@ _B = "22222222-2222-4222-8222-222222222222"
 
 
 class OrchestratorTests(unittest.TestCase):
+    def test_implementation_timeout_has_durable_diagnostic_and_no_later_execution(self):
+        def timeout(*args, **kwargs):
+            return replace(self.implement(*args, **kwargs), succeeded=False, exit_status=None,
+                           timed_out=True, elapsed_seconds=11.5, cleanup_result="parent_not_reaped",
+                           error_code="PROCESS_TIMEOUT", report=None, session_id=None)
+        output = io.StringIO()
+        with redirect_stderr(output):
+            result = self.execute(implement=timeout)
+        self.assert_stopped(result, "PROCESS_TIMEOUT")
+        self.assertEqual(result.timeout.operation, "implementation")
+        self.assertEqual(result.timeout.configured_seconds, 11)
+        self.assertEqual(result.timeout.elapsed_seconds, 11.5)
+        self.assertEqual(load_checkpoint(self.checkpoint_path)["timeout"], result.timeout.record())
+        self.assertEqual((len(self.a_calls), len(self.test_calls), len(self.b_calls)), (1, 0, 0))
+        self.assertIn("AUTO-CODING STOPPED - TIMEOUT", output.getvalue())
+        self.assertIn("Codex A implementation", output.getvalue())
+        self.assertIn("Configured limit: 11 seconds", output.getvalue())
+
+    def test_review_timeout_has_durable_diagnostic_without_publication(self):
+        def timeout(*args, **kwargs):
+            self.b_calls.append((args, kwargs))
+            return ReviewResult(False, None, "PROCESS_TIMEOUT", None, True, "taskkill_completed")
+        output = io.StringIO()
+        with redirect_stderr(output):
+            result = self.execute(review=timeout)
+        self.assert_stopped(result, "PROCESS_TIMEOUT")
+        self.assertEqual(result.timeout.operation, "review")
+        self.assertEqual(result.timeout.configured_seconds, 12)
+        self.assertGreaterEqual(result.timeout.elapsed_seconds, 0)
+        self.assertEqual(load_checkpoint(self.checkpoint_path)["timeout"], result.timeout.record())
+        self.assertIn("Operation: Codex B review", output.getvalue())
+        self.assertEqual(self.git("rev-parse", "HEAD").decode().strip(), self.head)
+
+    def test_usage_or_invocation_failure_is_not_a_timeout(self):
+        # Preserve either a generic failed exit or an explicit adapter reason;
+        # the controller does not infer a quota diagnosis from elapsed time.
+        for code in ("PROCESS_FAILED", "CODEX_USAGE_LIMIT"):
+            with self.subTest(code=code):
+                def failure(*args, **kwargs):
+                    self.a_calls.append((args, kwargs))
+                    return replace(self.a_result, succeeded=False, exit_status=1, timed_out=False,
+                                   error_code=code, report=None, session_id=None)
+                output = io.StringIO()
+                path = self.parent / f"{code}.json"
+                with redirect_stderr(output):
+                    result = self.execute(implement=failure, checkpoint_path=path)
+                self.assert_stopped(result, code)
+                self.assertIsNone(result.timeout)
+                self.assertNotIn("timeout", load_checkpoint(path))
+                self.assertNotIn("TIMEOUT", output.getvalue())
+        self.assertEqual((len(self.a_calls), len(self.test_calls), len(self.b_calls)), (2, 0, 0))
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="First Task ")
         self.addCleanup(temporary.cleanup)
@@ -547,6 +602,7 @@ class SingleTaskPublicationTests(unittest.TestCase):
                     replace(self.handoff, expected_branch="other"), replace(self.handoff, expected_head="0" * 40),
                     replace(self.handoff, expected_origin_url="https://wrong.invalid/repo"),
                     replace(self.handoff, permitted_files=("app.txt",)),
+                    replace(self.handoff, timeout=TimeoutDiagnostic("implementation", 11)),
                     replace(self.handoff, implementer_session_id=_B), replace(self.handoff, reviewer_session_id=None),
                     replace(self.handoff, reviewed_packet=None), replace(self.handoff, evidence=None),
                     replace(self.handoff, implementation=replace(self.handoff.implementation, succeeded=False)),
@@ -703,6 +759,9 @@ class SingleTaskPublicationTests(unittest.TestCase):
         self.assertEqual(self.remote_head(), result.commit_sha)
         self.assertEqual(sum(args[0] == "push" for args in calls), 1)
         self.assertEqual(load_checkpoint(self.checkpoint_path)["status"], "stopped")
+        self.assertEqual(result.timeout.operation, "git_push")
+        self.assertEqual(load_checkpoint(self.checkpoint_path)["timeout"], result.timeout.record())
+        self.assertEqual(self.report()["checkpoint"]["timeout"], result.timeout.record())
 
     def test_checkpoint_failure_before_staging_prevents_all_git_mutations(self):
         with patch("auto_coding.orchestrator.update_checkpoint", side_effect=OSError("private")) as update:
@@ -1220,10 +1279,25 @@ class SequentialBatchTests(unittest.TestCase):
             return result if self.active == 1 else replace(result, passed=False, first_failed_index=1,
                   command_results=(replace(result.command_results[0], exit_status=None, timed_out=True,
                                            cleanup_result="taskkill_completed"),))
-        result = self.run_batch(tests=tests)
+        output = io.StringIO()
+        with redirect_stderr(output):
+            result = self.run_batch(tests=tests)
         self.assertEqual(result.error_code, "TEST_TIMEOUT", result)
         self.assertEqual((len(self.a_calls), len(self.b_calls)), (2, 1))
         self.assertTrue(self.data()["tasks"][1]["terminal_results"]["command_results"][0]["timed_out"])
+        self.assertEqual(result.completed_task_ids, ("task-1",))
+        self.assertEqual((len(self.test_calls), len(self.stage_calls), len(self.publish_calls)), (2, 1, 1))
+        self.assertEqual(result.timeout.operation, "tests")
+        self.assertEqual(result.timeout.configured_seconds, 22)
+        self.assertEqual(self.checkpoint()["timeout"], result.timeout.record())
+        self.assertEqual(self.data()["checkpoint"]["timeout"], result.timeout.record())
+        self.assertIn("STOPPED - TIMEOUT", (self.metadata / "batch-report.md").read_text(encoding="utf-8"))
+        self.assertIn("Published task: task-1", output.getvalue())
+        self.assertIn("Task: task-2", output.getvalue())
+        self.assertEqual(self.data()["tasks"][2]["status"], "pending")
+        commit = result.publications[0][1]
+        self.assertEqual(self.git("rev-parse", "HEAD").decode().strip(), commit)
+        self.assertEqual(self.git("ls-remote", "origin", f"refs/heads/{self.branch}").decode().split()[0], commit)
 
     def _fail_later_publication(self, action, *, ambiguous=False):
         query = git_publish._git_query

@@ -23,6 +23,7 @@ from auto_coding.review import (
 )
 from auto_coding.scope_check import _changed_paths
 from auto_coding.test_runner import TestCommandResult, TestRunResult
+from auto_coding.operations import TimeoutDiagnostic
 
 
 _MAX_OUTPUT_BYTES = 64 * 1024
@@ -230,6 +231,7 @@ class GitStageResult:
     staged_paths: tuple[str, ...] | None = None
     staged_changes_sha256: str | None = None
     staged_state_error_code: str | None = None
+    timeout: TimeoutDiagnostic | None = None
 
 
 class _StageFailure(ValueError):
@@ -445,23 +447,28 @@ def stage_reviewed_changes(
     attempted = False
     query = None
     raw_arguments = None
+    timeout_detail = None
 
     def finish(error=None, verified_raw=None):
+        nonlocal timeout_detail
+        if error == "GIT_TIMEOUT" and timeout_detail is None:
+            timeout_detail = TimeoutDiagnostic("git_preflight", timeout_seconds)
         if not attempted:
-            return GitStageResult(False, error)
+            return GitStageResult(False, error, timeout=timeout_detail)
         try:
             raw = verified_raw if verified_raw is not None else query(raw_arguments)
             entries = _raw_index_entries(raw)
             return GitStageResult(
                 error is None, error, True, tuple(sorted(entries)),
                 hashlib.sha256(raw).hexdigest(),
+                timeout=timeout_detail,
             )
         except _StageFailure as exc:
             return GitStageResult(False, error or "STAGED_STATE_UNKNOWN", True,
-                                  staged_state_error_code=str(exc))
+                                  staged_state_error_code=str(exc), timeout=timeout_detail)
         except (OSError, ValueError):
             return GitStageResult(False, error or "STAGED_STATE_UNKNOWN", True,
-                                  staged_state_error_code="STAGED_STATE_UNKNOWN")
+                                  staged_state_error_code="STAGED_STATE_UNKNOWN", timeout=timeout_detail)
 
     try:
         evidence = _review_snapshot(reviewed_packet, review_result, max_bytes)
@@ -496,10 +503,14 @@ def stage_reviewed_changes(
         environment.update(GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="Never")
 
         def run(arguments):
+            nonlocal timeout_detail
             code, output, error = _git_query(
                 repository, arguments, timeout_seconds, temporary, environment, max_bytes,
             )
             if error:
+                if error == "GIT_TIMEOUT" and timeout_detail is None:
+                    operation = "git_staging" if "add" in arguments[:2] else "git_verification"
+                    timeout_detail = TimeoutDiagnostic(operation, timeout_seconds)
                 raise _StageFailure(error)
             return code, output
 
@@ -545,6 +556,8 @@ def stage_reviewed_changes(
             allow_staged=True,
         )
         if not final.passed:
+            if final.error_code == "GIT_TIMEOUT" and timeout_detail is None:
+                timeout_detail = TimeoutDiagnostic("git_verification", timeout_seconds)
             raise _StageFailure(final.error_code)
         # Ensure the index did not change during the final state queries.
         if query(raw_arguments) != raw:
@@ -569,6 +582,7 @@ class GitPublishResult:
     commit_sha: str | None = None
     remote_sha: str | None = None
     observed_head_sha: str | None = None
+    timeout: TimeoutDiagnostic | None = None
 
     @property
     def passed(self) -> bool:
@@ -599,11 +613,16 @@ def publish_reviewed_changes(
     outcome = "NOT_ATTEMPTED"
     commit_attempted = push_attempted = False
     commit_sha = remote_sha = observed_head_sha = None
+    timeout_detail = None
 
     def finish(error=None):
+        nonlocal timeout_detail
+        if error == "GIT_TIMEOUT" and timeout_detail is None:
+            timeout_detail = TimeoutDiagnostic("git_preflight" if not commit_attempted else "git_verification", timeout_seconds)
         return GitPublishResult(
             outcome, error, commit_attempted, push_attempted,
             commit_sha, remote_sha, observed_head_sha,
+            timeout=timeout_detail,
         )
 
     try:
@@ -642,10 +661,14 @@ def publish_reviewed_changes(
         environment.update(GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="Never")
 
         def run(arguments):
+            nonlocal timeout_detail
             code, output, error = _git_query(
                 repository, arguments, timeout_seconds, temporary, environment, max_bytes,
             )
             if error:
+                if error == "GIT_TIMEOUT" and timeout_detail is None:
+                    operation = {"commit": "git_commit", "push": "git_push"}.get(arguments[0], "git_verification")
+                    timeout_detail = TimeoutDiagnostic(operation, timeout_seconds)
                 raise _StageFailure(error)
             return code, output
 

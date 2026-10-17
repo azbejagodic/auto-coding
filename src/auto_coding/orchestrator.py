@@ -15,6 +15,7 @@ from pathlib import Path
 import re
 import stat
 import uuid
+import time
 
 from auto_coding.batch_state import CheckpointError, create_checkpoint, load_checkpoint, update_checkpoint, validate_checkpoint_capacity
 from auto_coding.batch_report import BatchReportError, ReportExportError, build_batch_report, export_batch_report
@@ -29,7 +30,8 @@ from auto_coding.integrations.codex import ImplementationOutcome, Implementation
 from auto_coding.plan_freeze import PlanIntegrityError, load_frozen_plan, plan_fingerprint
 from auto_coding.plan_preflight import preflight_frozen_plan, _preflight_verified_plan
 from auto_coding.review import ReviewResult, _evidence_fingerprint, _packet_json_size, build_review_packet, run_review_packet
-from auto_coding.test_runner import TestRunResult, _command_identity, run_approved_tests
+from auto_coding.test_runner import TestCommandResult, TestRunResult, _command_identity, run_approved_tests
+from auto_coding.operations import TimeoutDiagnostic, show_timeout
 
 
 @dataclass(frozen=True)
@@ -56,6 +58,7 @@ class FirstTaskReviewResult:
     evidence: ChangeEvidence | None = field(default=None, repr=False)
     review: ReviewResult | None = field(default=None, repr=False)
     reviewed_packet: bytes | None = field(default=None, repr=False)
+    timeout: TimeoutDiagnostic | None = None
 
     @property
     def ready_for_publication(self) -> bool:
@@ -63,7 +66,13 @@ class FirstTaskReviewResult:
 
 
 class _Stop(Exception):
-    pass
+    def __init__(self, code, *, timeout=None):
+        super().__init__(code)
+        self.timeout = timeout
+
+
+def _git_stop(code, seconds, operation="git_verification"):
+    return _Stop(code, timeout=TimeoutDiagnostic(operation, seconds) if code == "GIT_TIMEOUT" else None)
 
 
 class _CheckpointFailure(Exception):
@@ -88,10 +97,10 @@ def _snapshot(repository, plan, task, timeout, max_bytes):
     state = check_publish_preflight(repository, plan["expected_branch"], plan["expected_head"],
                                     plan["expected_origin_url"], timeout)
     if not state.passed:
-        raise _Stop(_code(state.error_code, "GIT_STATE_UNVERIFIED"))
-    evidence = collect_change_evidence(repository, task["permitted_files"], max_bytes)
+        raise _git_stop(_code(state.error_code, "GIT_STATE_UNVERIFIED"), timeout)
+    evidence = collect_change_evidence(repository, task["permitted_files"], max_bytes, timeout_seconds=timeout)
     if not isinstance(evidence, ChangeEvidence) or evidence.passed is not True:
-        raise _Stop(_code(getattr(evidence, "error_code", None), "EVIDENCE_INVALID"))
+        raise _git_stop(_code(getattr(evidence, "error_code", None), "EVIDENCE_INVALID"), timeout)
     if (evidence.error_code is not None or not isinstance(evidence.changed_paths, tuple)
             or not evidence.changed_paths or not isinstance(evidence.tracked_diff, bytes)
             or not isinstance(evidence.untracked_files, tuple)):
@@ -135,6 +144,8 @@ def _context(repository, plan, evidence, timeout, max_bytes):
                 timeout, temporary, environment, remaining,
             )
             if error or code != 0:
+                if error == "GIT_TIMEOUT":
+                    raise _git_stop(error, timeout)
                 raise _Stop("CONTEXT_TOO_LARGE" if error == "GIT_OUTPUT_TOO_LARGE" else "CONTEXT_UNAVAILABLE")
         else:
             if not stat.S_ISREG(before.st_mode):
@@ -184,7 +195,7 @@ def _task_preflight(frozen, approval, repository, timeout, position):
 
 def _execute_task_through_review(
     frozen_plan_path, approved_sha256, repository_directory, checkpoint_path,
-    git_timeout_seconds, evidence_max_bytes, packet_max_bytes, *, position=None, prior_sessions=(),
+    git_timeout_seconds, evidence_max_bytes, packet_max_bytes, *, position=None, prior_sessions=(), prior_publications=(),
 ) -> FirstTaskReviewResult:
     """Return an in-memory handoff for D16b; never stage, publish or complete.
 
@@ -199,6 +210,14 @@ all further execution and is never retried. Ignored files follow Git semantics.
     state = None
     destination = None
     created = False
+    preflight = None
+
+    def remember_timeout(diagnostic):
+        if diagnostic is not None and values.get("timeout") is None:
+            values["timeout"] = diagnostic
+            show_timeout(diagnostic, values.get("batch_id") or getattr(preflight, "batch_id", None),
+                         values.get("task_id") or (f"task-number-{position[0] + 1}" if position else None),
+                         prior_publications)
 
     def finish(error=None, checkpoint_error=None, ready=False):
         outcome = "READY_FOR_PUBLICATION" if ready else (
@@ -220,7 +239,7 @@ all further execution and is never retried. Ignored files follow Git semantics.
             raise _Stop("INVALID_MAX_BYTES")
         preflight = _task_preflight(frozen_plan_path, approved_sha256, repository_directory, git_timeout_seconds, position)
         if not preflight.ready:
-            raise _Stop(_code(preflight.error_code, "PREFLIGHT_FAILED"))
+            raise _git_stop(_code(preflight.error_code, "PREFLIGHT_FAILED"), git_timeout_seconds, "git_preflight")
         try:
             plan = load_frozen_plan(frozen_plan_path, approved_sha256)
         except PlanIntegrityError:
@@ -261,7 +280,7 @@ all further execution and is never retried. Ignored files follow Git semantics.
         # Recheck critical starting state immediately before the first invocation.
         preflight = _task_preflight(frozen_plan_path, approved_sha256, repository, git_timeout_seconds, position)
         if not preflight.ready:
-            raise _Stop(_code(preflight.error_code, "PREFLIGHT_FAILED"))
+            raise _git_stop(_code(preflight.error_code, "PREFLIGHT_FAILED"), git_timeout_seconds, "git_preflight")
         prompt = task["review"]["prompt"]
         if not isinstance(prompt, str) or not prompt.strip() or any(0xD800 <= ord(c) <= 0xDFFF for c in prompt):
             raise _Stop("REVIEW_INSTRUCTIONS_INVALID")
@@ -272,11 +291,16 @@ all further execution and is never retried. Ignored files follow Git semantics.
         implementation = run_implementation(settings["prompt"], settings["model"], settings["reasoning_effort"],
                                             repository, task["limits"]["implementation_seconds"], session_id=None)
         values["implementation"] = implementation
+        if isinstance(implementation, ImplementationOutcome) and implementation.timed_out is True:
+            remember_timeout(TimeoutDiagnostic("implementation", task["limits"]["implementation_seconds"],
+                                               implementation.elapsed_seconds))
         if isinstance(implementation, ImplementationOutcome) and _session(implementation.session_id):
             values["implementer_session_id"] = implementation.session_id
             persist(implementer_session_id=implementation.session_id)
             if implementation.session_id.lower() in prior_sessions:
                 raise _Stop("BATCH_SESSION_REUSED")
+        if isinstance(implementation, ImplementationOutcome) and implementation.timed_out is True:
+            raise _Stop("PROCESS_TIMEOUT")
         if (not isinstance(implementation, ImplementationOutcome) or implementation.succeeded is not True
                 or type(implementation.exit_status) is not int or implementation.exit_status != 0
                 or implementation.timed_out is not False or implementation.cleanup_result != "not_needed"
@@ -291,12 +315,15 @@ all further execution and is never retried. Ignored files follow Git semantics.
         persist(stage="testing")
         tests = run_approved_tests(repository, task["test_commands"], task["limits"]["test_seconds"])
         values["terminal_results"] = tests
+        if isinstance(tests, TestRunResult) and isinstance(tests.command_results, tuple):
+            for command in tests.command_results:
+                if isinstance(command, TestCommandResult) and command.timed_out is True:
+                    raise _Stop("TEST_TIMEOUT", timeout=TimeoutDiagnostic(
+                        "tests", task["limits"]["test_seconds"], command.elapsed_seconds))
         evidence = _snapshot(repository, git_state, task, git_timeout_seconds, evidence_max_bytes)
         values["evidence"] = evidence
         if not isinstance(tests, TestRunResult) or tests.passed is not True:
             if isinstance(tests, TestRunResult) and isinstance(tests.command_results, tuple):
-                if any(getattr(result, "timed_out", None) is True for result in tests.command_results):
-                    raise _Stop("TEST_TIMEOUT")
                 if any(getattr(result, "cleanup_result", None) != "not_needed" for result in tests.command_results):
                     raise _Stop("TEST_CLEANUP_UNCERTAIN")
             raise _Stop("TESTS_NOT_PASSED")
@@ -312,11 +339,15 @@ all further execution and is never retried. Ignored files follow Git semantics.
         values["reviewed_packet"] = packet
         settings = task["review"]
         values["review_started"] = True
+        review_started_at = time.monotonic()
         review = run_review_packet(evidence, task["acceptance_criteria"], task["test_commands"], tests, context, packet_max_bytes,
                                    model=settings["model"], reasoning_effort=settings["reasoning_effort"],
                                    repository_directory=repository, timeout_seconds=task["limits"]["review_seconds"],
                                    session_id=None, review_prompt=settings["prompt"])
         values["review"] = review
+        if isinstance(review, ReviewResult) and review.timed_out is True:
+            remember_timeout(TimeoutDiagnostic("review", task["limits"]["review_seconds"],
+                                               time.monotonic() - review_started_at))
         if isinstance(review, ReviewResult) and _session(review.session_id):
             values["reviewer_session_id"] = review.session_id
             if review.session_id.lower() == implementation.session_id.lower():
@@ -324,6 +355,8 @@ all further execution and is never retried. Ignored files follow Git semantics.
             persist(reviewer_session_id=review.session_id)
             if review.session_id.lower() in prior_sessions:
                 raise _Stop("BATCH_SESSION_REUSED")
+        if isinstance(review, ReviewResult) and review.timed_out is True:
+            raise _Stop("PROCESS_TIMEOUT")
         if not isinstance(review, ReviewResult) or review.approved is not True:
             raise _Stop(_code(getattr(review, "error_code", None), "REVIEW_NOT_APPROVED"))
         if _review_snapshot(packet, review, packet_max_bytes) != evidence:
@@ -338,10 +371,12 @@ all further execution and is never retried. Ignored files follow Git semantics.
         return finish("CHECKPOINT_WRITE_FAILED", "CHECKPOINT_WRITE_FAILED")
     except Exception as error:
         reason = _code(str(error), "EXECUTION_FAILED") if isinstance(error, (_Stop, _StageFailure)) else "EXECUTION_FAILED"
+        remember_timeout(getattr(error, "timeout", None))
         checkpoint_error = None
         if created:
             try:
-                persist(status="stopped", stop_reason_code=reason)
+                persist(status="stopped", stop_reason_code=reason,
+                        **({"timeout": values["timeout"].record()} if values.get("timeout") is not None else {}))
             except _CheckpointFailure:
                 checkpoint_error = "CHECKPOINT_WRITE_FAILED"
         return finish(reason, checkpoint_error)
@@ -373,6 +408,7 @@ class SingleTaskPublishResult:
     publishing: GitPublishResult | None = field(default=None, repr=False)
     report_paths: tuple[Path, ...] = field(default=(), repr=False)
     partial_report_paths: tuple[Path, ...] = field(default=(), repr=False)
+    timeout: TimeoutDiagnostic | None = None
 
 
 def _sha(value):
@@ -385,7 +421,7 @@ def _publication_handoff(handoff, plan, approved_sha256, evidence_limit, packet_
     starting_head = plan["expected_head"] if position is None else position[1]
     if (not isinstance(handoff, FirstTaskReviewResult) or handoff.outcome != "READY_FOR_PUBLICATION"
             or handoff.stage != "publishing" or handoff.error_code is not None
-            or handoff.checkpoint_error_code is not None or handoff.implementation_started is not True
+            or handoff.checkpoint_error_code is not None or handoff.timeout is not None or handoff.implementation_started is not True
             or handoff.review_started is not True or handoff.batch_id != plan["batch_id"]
             or handoff.task_id != task["task_id"] or handoff.plan_sha256 != approved_sha256
             or handoff.expected_branch != plan["expected_branch"] or handoff.expected_head != starting_head
@@ -578,7 +614,7 @@ def publish_single_task_batch(
 
 def _publish_task(
     handoff, frozen_plan_path, approved_sha256, git_timeout_seconds, evidence_max_bytes,
-    packet_max_bytes, report_max_bytes, metadata_directory, repository_identifier, *, position=None,
+    packet_max_bytes, report_max_bytes, metadata_directory, repository_identifier, *, position=None, prior_publications=(),
 ) -> SingleTaskPublishResult:
     """Complete one approved task using only D13 mutations and D14 finalization.
 
@@ -670,7 +706,10 @@ be unavailable. Reporting failure never changes verified publication truth.
                                         plan["expected_origin_url"], git_timeout_seconds, task["permitted_files"],
                                         handoff.reviewed_packet, handoff.review, max(evidence_max_bytes, packet_max_bytes))
         values["staging"] = staged if isinstance(staged, GitStageResult) else None
-        if (not isinstance(staged, GitStageResult) or staged.passed is not True or staged.error_code is not None
+        if isinstance(staged, GitStageResult) and staged.timeout is not None:
+            values["timeout"] = staged.timeout
+            show_timeout(staged.timeout, plan["batch_id"], task["task_id"], prior_publications)
+        if (not isinstance(staged, GitStageResult) or staged.passed is not True or staged.error_code is not None or staged.timeout is not None
                 or staged.staging_attempted is not True or staged.staged_state_error_code is not None
                 or staged.staged_paths != handoff.evidence.changed_paths
                 or not isinstance(staged.staged_changes_sha256, str)
@@ -686,6 +725,9 @@ be unavailable. Reporting failure never changes verified publication truth.
                                              handoff.reviewed_packet, handoff.review, max(evidence_max_bytes, packet_max_bytes),
                                              f"auto-coding: {task['task_id']}")
         values["publishing"] = publishing if isinstance(publishing, GitPublishResult) else None
+        if isinstance(publishing, GitPublishResult) and publishing.timeout is not None:
+            values["timeout"] = publishing.timeout
+            show_timeout(publishing.timeout, plan["batch_id"], task["task_id"], prior_publications)
         if not isinstance(publishing, GitPublishResult):
             raise _Stop("PUBLICATION_UNVERIFIED")
         if _sha(publishing.commit_sha):
@@ -698,7 +740,7 @@ be unavailable. Reporting failure never changes verified publication truth.
             elif publishing.outcome == "NOT_ATTEMPTED":
                 outcome = "STOPPED_AFTER_STAGING"
             raise _Stop(_code(publishing.error_code, "PUBLICATION_UNVERIFIED"))
-        if (publishing.error_code is not None or publishing.commit_attempted is not True or publishing.push_attempted is not True
+        if (publishing.error_code is not None or publishing.timeout is not None or publishing.commit_attempted is not True or publishing.push_attempted is not True
                 or not _sha(publishing.commit_sha) or publishing.commit_sha != publishing.remote_sha
                 or publishing.observed_head_sha != publishing.commit_sha):
             raise _Stop("PUBLICATION_UNVERIFIED")
@@ -714,7 +756,8 @@ be unavailable. Reporting failure never changes verified publication truth.
         reason = _code(str(error), "FINALIZATION_FAILED") if isinstance(error, (_Stop, _StageFailure)) else "FINALIZATION_FAILED"
     if reason is not None and authenticated and not storage_failed and not values.get("published"):
         try:
-            persist(status="stopped", stop_reason_code=reason)
+            persist(status="stopped", stop_reason_code=reason,
+                    **({"timeout": values["timeout"].record()} if values.get("timeout") is not None else {}))
         except _CheckpointFailure:
             values["checkpoint_error_code"] = "CHECKPOINT_WRITE_FAILED"
     if authenticated:
@@ -771,6 +814,7 @@ class SequentialBatchResult:
     checkpoint_path: Path | None = field(default=None, repr=False)
     report_paths: tuple[Path, ...] = field(default=(), repr=False)
     partial_report_paths: tuple[Path, ...] = field(default=(), repr=False)
+    timeout: TimeoutDiagnostic | None = None
 
 
 def _pending_task_record(task):
@@ -805,6 +849,7 @@ resume, retry or repair are performed. All resource limits remain in force.
     handoff = published = None
     sessions = set()
     execution_invoked = False
+    timeout_detail = None
 
     def persist(candidate, *, complete=False):
         nonlocal state, storage_failed
@@ -824,6 +869,9 @@ resume, retry or repair are performed. All resource limits remain in force.
             raise _Stop("INVALID_MAX_BYTES")
         preflight = preflight_frozen_plan(frozen_plan_path, approved_sha256, repository_directory, git_timeout_seconds)
         if preflight.ready is not True or preflight.error_code is not None:
+            timeout_detail = getattr(preflight, "timeout", None)
+            if timeout_detail is not None:
+                show_timeout(timeout_detail, preflight.batch_id)
             raise _Stop(_code(preflight.error_code, "PREFLIGHT_FAILED"))
         plan = load_frozen_plan(frozen_plan_path, approved_sha256)
         if plan["schema_version"] != 2 or plan_fingerprint(plan) != approved_sha256:
@@ -885,17 +933,20 @@ resume, retry or repair are performed. All resource limits remain in force.
             handoff = _execute_task_through_review(
                 frozen_plan_path, approved_sha256, repository, child / "batch-checkpoint.json",
                 git_timeout_seconds, evidence_max_bytes, packet_max_bytes, position=(index, starting_head),
-                prior_sessions=sessions)
+                prior_sessions=sessions, prior_publications=tuple(item[0] for item in publications))
+            timeout_detail = handoff.timeout
             if (handoff.outcome != "READY_FOR_PUBLICATION" or handoff.error_code is not None
-                    or handoff.checkpoint_error_code is not None):
+                    or handoff.checkpoint_error_code is not None or handoff.timeout is not None):
                 phase = handoff.stage
                 raise _Stop(_code(handoff.error_code, "REVIEW_HANDOFF_INVALID"))
             phase = "publishing"
             published = _publish_task(
                 handoff, frozen_plan_path, approved_sha256, git_timeout_seconds, evidence_max_bytes,
-                packet_max_bytes, report_max_bytes, child, repository_identifier, position=(index, starting_head))
+                packet_max_bytes, report_max_bytes, child, repository_identifier, position=(index, starting_head),
+                prior_publications=tuple(item[0] for item in publications))
             if not isinstance(published, SingleTaskPublishResult):
                 raise _Stop("PUBLICATION_UNVERIFIED")
+            timeout_detail = published.timeout
             observed = published.publishing
             if published.published is True and (
                     not isinstance(observed, GitPublishResult) or observed.outcome != "PUBLISHED"
@@ -925,6 +976,8 @@ resume, retry or repair are performed. All resource limits remain in force.
                                  current_head=entries[-1]["commit_sha"] if entries else state["base_head"],
                                  status="stopped", stage=phase if phase in {"staging", "publishing"} else "publishing",
                                  stop_reason_code=_code(published.error_code, "PUBLICATION_UNVERIFIED"))
+                if timeout_detail is not None:
+                    candidate["timeout"] = timeout_detail.record()
                 persist(candidate)
                 raise _Stop(candidate["stop_reason_code"])
             completed.append(current)
@@ -949,7 +1002,8 @@ resume, retry or repair are performed. All resource limits remain in force.
         if state["status"] != "stopped":
             stage = phase if phase in {"implementation", "testing", "review", "staging", "publishing"} else state["stage"]
             try:
-                persist(dict(state, status="stopped", stage=stage, stop_reason_code=reason))
+                persist(dict(state, status="stopped", stage=stage, stop_reason_code=reason,
+                             **({"timeout": timeout_detail.record()} if timeout_detail is not None else {})))
             except _CheckpointFailure:
                 checkpoint_error = "BATCH_CHECKPOINT_WRITE_FAILED"
         try:
@@ -992,4 +1046,5 @@ resume, retry or repair are performed. All resource limits remain in force.
     outcome = ("COMPLETED" if reason is None else "PUBLISHED_NOT_FINALIZED"
                if state is not None and state["status"] == "completed" else "PARTIALLY_COMPLETED" if publications else "STOPPED")
     return SequentialBatchResult(outcome, phase, reason, checkpoint_error, report_error,
-                                 tuple(completed), tuple(publications), current, path, paths, partial_paths)
+                                 tuple(completed), tuple(publications), current, path, paths, partial_paths,
+                                 timeout=timeout_detail)

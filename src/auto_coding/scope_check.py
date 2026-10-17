@@ -5,6 +5,7 @@ Git-ignored files are not visible to this check.
 
 from dataclasses import dataclass
 from pathlib import Path
+import math
 import subprocess
 
 
@@ -45,9 +46,15 @@ def _changed_paths(output: bytes) -> tuple[str, ...]:
 
 
 def check_file_scope(
-    repository_directory: str | Path, permitted_files: list[str]
+    repository_directory: str | Path, permitted_files: list[str], *, timeout_seconds: float = 120,
 ) -> FileScopeResult:
     """Check pending Git paths against an explicit Windows-insensitive file list."""
+    try:
+        valid = type(timeout_seconds) in (int, float) and math.isfinite(timeout_seconds) and timeout_seconds > 0
+    except OverflowError:
+        valid = False
+    if not valid:
+        return FileScopeResult(False, (), (), "INVALID_TIMEOUT")
     if not isinstance(permitted_files, list) or any(
         not isinstance(path, str) or not path for path in permitted_files
     ):
@@ -62,7 +69,7 @@ def check_file_scope(
             stderr=subprocess.DEVNULL,
             shell=False,
             check=False,
-            timeout=10,
+            timeout=timeout_seconds,
         )
     except subprocess.TimeoutExpired:
         return FileScopeResult(False, (), (), "GIT_TIMEOUT")

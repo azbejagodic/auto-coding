@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass, field
 import hashlib
+import math
 import os
 from pathlib import Path
 import stat
@@ -49,7 +50,7 @@ def _external_temporary_directory(repository: Path) -> Path | None:
 
 
 def _git(repository: Path, arguments: list[str], max_bytes: int,
-         temporary_directory: Path
+         temporary_directory: Path, timeout_seconds: float = 120,
          ) -> tuple[bytes | None, str | None]:
     try:
         with tempfile.TemporaryFile(mode="w+b", dir=temporary_directory) as output:
@@ -57,7 +58,7 @@ def _git(repository: Path, arguments: list[str], max_bytes: int,
                 result = subprocess.run(
                     ["git", *arguments], cwd=repository, stdin=subprocess.DEVNULL,
                     stdout=output, stderr=subprocess.DEVNULL, shell=False,
-                    check=False, timeout=10,
+                    check=False, timeout=timeout_seconds,
                 )
             except subprocess.TimeoutExpired:
                 return None, "GIT_TIMEOUT"
@@ -137,11 +138,18 @@ def _digest_part(digest, value: bytes) -> None:
 
 def collect_change_evidence(
     repository_directory: str | Path, permitted_files: list[str], max_bytes: int,
+    *, timeout_seconds: float = 120,
 ) -> ChangeEvidence:
     """Capture complete pending changes; callers must recheck before publishing."""
     if type(max_bytes) is not int or max_bytes <= 0:
         return ChangeEvidence(False, error_code="INVALID_MAX_BYTES")
-    scope = check_file_scope(repository_directory, permitted_files)
+    try:
+        valid = type(timeout_seconds) in (int, float) and math.isfinite(timeout_seconds) and timeout_seconds > 0
+    except OverflowError:
+        valid = False
+    if not valid:
+        return ChangeEvidence(False, error_code="INVALID_TIMEOUT")
+    scope = check_file_scope(repository_directory, permitted_files, timeout_seconds=timeout_seconds)
     if not scope.passed:
         return ChangeEvidence(False, error_code=scope.error_code or "OUT_OF_SCOPE")
 
@@ -158,7 +166,7 @@ def collect_change_evidence(
         return ChangeEvidence(False, error_code="UNSAFE_PATH")
 
     raw, error = _git(repository, ["diff", *_DIFF_OPTIONS, "--raw", "-z", "HEAD", "--"],
-                       max_bytes, temporary_directory)
+                       max_bytes, temporary_directory, timeout_seconds)
     if error:
         return ChangeEvidence(False, error_code=error)
     try:
@@ -167,7 +175,7 @@ def collect_change_evidence(
         return ChangeEvidence(False, error_code="UNSAFE_OR_MALFORMED_DIFF")
 
     untracked_raw, error = _git(repository, ["ls-files", "--others", "--exclude-standard", "-z"],
-                                max_bytes, temporary_directory)
+                                max_bytes, temporary_directory, timeout_seconds)
     if error:
         return ChangeEvidence(False, error_code=error)
     try:
@@ -181,7 +189,7 @@ def collect_change_evidence(
         return ChangeEvidence(False, error_code="INCONSISTENT_EVIDENCE")
 
     diff, error = _git(repository, ["diff", *_DIFF_OPTIONS, "--binary", "--full-index",
-                                    "HEAD", "--"], max_bytes, temporary_directory)
+                                    "HEAD", "--"], max_bytes, temporary_directory, timeout_seconds)
     if error:
         return ChangeEvidence(False, error_code=error)
     total = len(diff) + sum(len(path.encode("utf-8")) for path in changed)

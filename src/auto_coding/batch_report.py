@@ -131,7 +131,8 @@ def _array(schema, limit=100):
 
 
 _CONFIDENCE = _enum("LOW", "MEDIUM", "HIGH")
-_CLEANUP = _enum("not_needed", "taskkill_completed", "taskkill_failed", "taskkill_timed_out")
+_CLEANUP = _enum("not_needed", "taskkill_completed", "taskkill_failed", "taskkill_timed_out",
+                 "parent_not_reaped", "launch_failed")
 _ROLE = {
     "model": _MODEL, "reasoning_effort": _enum("low", "medium", "high", "xhigh"),
     "session_id": _optional(_uuid), "session_mode": _optional(_enum("fresh", "resumed")),
@@ -392,6 +393,12 @@ def _markdown(data, limit):
     append("")
     append(_escaped(_PROVENANCE))
     append("")
+    diagnostic = data["checkpoint"].get("timeout")
+    if diagnostic is not None:
+        append("## STOPPED - TIMEOUT")
+        append("Operation exceeded its configured time limit; later tasks were not started.")
+        render(diagnostic)
+        append("")
     for key in ("checkpoint", "batch"):
         append("## " + key.title())
         append("")
@@ -466,6 +473,21 @@ Operational events use the logger's fields, with absent optional keys set to Non
         if not sequential:
             for field, role in (("implementer_session_id", "implementer"), ("reviewer_session_id", "reviewer")):
                 _require(checkpoint[field] == task[role]["session_id"])
+        diagnostic = checkpoint.get("timeout")
+        if diagnostic is not None:
+            operation = diagnostic["operation"]
+            if operation == "implementation":
+                _require(task["implementation"] is not None and task["implementation"]["timed_out"])
+            elif operation == "tests":
+                _require(task["terminal_results"] is not None and any(
+                    command["timed_out"] for command in task["terminal_results"]["command_results"]))
+            elif operation == "review":
+                _require(task["review"] is not None and task["review"]["timed_out"])
+            else:
+                _require(task["stop_reason_code"] == "GIT_TIMEOUT" or any(
+                    task[field] is not None and task[field]["error_code"] == "GIT_TIMEOUT"
+                    for field in ("staging", "publishing")) or (
+                    task["staging"] is not None and task["staging"]["staged_state_error_code"] == "GIT_TIMEOUT"))
     identifiers = {t["task_id"] for t in tasks}
     for event in events:
         _require(event["batch_id"] in (None, checkpoint["batch_id"]))

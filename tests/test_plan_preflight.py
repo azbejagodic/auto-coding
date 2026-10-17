@@ -245,6 +245,12 @@ class PlanPreflightTests(unittest.TestCase):
                     result = self.check()
                 self.assertEqual(result.error_code, expected)
                 self.assertNotIn("private", repr(result))
+                if expected == "GIT_TIMEOUT":
+                    self.assertEqual(result.timeout.operation, "git_preflight")
+                    self.assertEqual(result.timeout.configured_seconds, 5)
+                    self.assertEqual(result.batch_id, self.plan["batch_id"])
+                else:
+                    self.assertIsNone(result.timeout)
 
     def test_status_launch_failure_timeout_overflow_and_malformed_output_fail_closed(self):
         for response, expected in (
@@ -258,6 +264,7 @@ class PlanPreflightTests(unittest.TestCase):
                 result = self.check()
                 self.assertEqual(result.error_code, expected)
                 self.assertEqual(query.call_args.args[1], _STATUS)
+                self.assertEqual(result.timeout is not None, expected == "GIT_TIMEOUT")
 
     def test_invalid_git_timeout_prevents_all_loading_and_git(self):
         for timeout in (True, None, 0, -1, float("nan"), float("inf"), 10**1000, "5"):

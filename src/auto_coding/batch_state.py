@@ -15,6 +15,7 @@ import tempfile
 import uuid
 
 from auto_coding.plans import PlanValidationError, _branch
+from auto_coding.operations import TimeoutDiagnostic
 
 
 class CheckpointError(ValueError):
@@ -41,6 +42,24 @@ def _matches(value: object, pattern: re.Pattern) -> bool:
 
 
 def _validate(data: object) -> dict:
+    # Backward-compatible optional extension: legacy v1/v2 records remain exact.
+    # Diagnostic records are legal only on a stopped checkpoint.
+    if isinstance(data, dict) and "timeout" in data:
+        extra = {"task_ids", "publications", "current_head"} if type(data.get("schema_version")) is int and data["schema_version"] == 2 else set()
+        if data.keys() != _FIELDS | extra | {"timeout"}:
+            raise CheckpointError("checkpoint fields are invalid")
+        details = data["timeout"]
+        if (not isinstance(details, dict) or details.keys() != {
+                "classification", "operation", "configured_seconds", "elapsed_seconds"}):
+            raise CheckpointError("invalid timeout fields")
+        try:
+            diagnostic = TimeoutDiagnostic(**details)
+        except (TypeError, ValueError):
+            raise CheckpointError("invalid timeout diagnostic") from None
+        base = _validate({key: value for key, value in data.items() if key != "timeout"})
+        if base["status"] != "stopped":
+            raise CheckpointError("timeout requires a stopped timeout result")
+        return dict(base, timeout=diagnostic.record())
     if isinstance(data, dict) and type(data.get("schema_version")) is int and data["schema_version"] == 2:
         return _validate_sequential(data)
     if not isinstance(data, dict) or data.keys() != _FIELDS:
@@ -157,7 +176,8 @@ def validate_checkpoint_capacity(state: object) -> None:
             head = "0" * 40
         data = dict(data, publications=reserved, current_head=head, status="completed",
                     current_task_id=max(data["task_ids"], key=len), stage="implementation", stop_reason_code="A" * 64)
-    if len(json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")) > _MAX_BYTES:
+    # Reserve bounded diagnostic space before executing any task.
+    if len(json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")) + 1024 > _MAX_BYTES:
         raise CheckpointError("checkpoint capacity exceeds metadata size limit")
 
 
@@ -238,6 +258,8 @@ not proof produced by storage. It is required to enter completed status.
     previous = load_checkpoint(destination)
     if data["schema_version"] != previous["schema_version"]:
         raise CheckpointError("checkpoint version cannot change")
+    if "timeout" in previous and data.get("timeout") != previous["timeout"]:
+        raise CheckpointError("recorded timeout cannot change")
     if any(data[f] != previous[f] for f in _IMMUTABLE):
         raise CheckpointError("batch identity cannot change")
     if any(previous[f] is not None and data[f] != previous[f] for f in _SESSIONS):

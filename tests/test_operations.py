@@ -6,10 +6,43 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+import io
+from contextlib import redirect_stderr
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from auto_coding.operations import OperationsLog
+from auto_coding.operations import OperationsLog, TimeoutDiagnostic, show_timeout
+
+
+class TimeoutDiagnosticTests(unittest.TestCase):
+    def test_timeout_record_and_sanitized_terminal_notice(self):
+        diagnostic = TimeoutDiagnostic("implementation", 1800, 1800.5)
+        output = io.StringIO()
+        with redirect_stderr(output):
+            show_timeout(diagnostic, "batch-1", "task-2", ("task-1",))
+        self.assertEqual(diagnostic.record()["classification"], "TIMEOUT")
+        for text in ("TIMEOUT", "batch-1", "task-2", "1800 seconds", "1800.5", "Published task: task-1", "NOT STARTED"):
+            self.assertIn(text, output.getvalue())
+        output = io.StringIO()
+        with redirect_stderr(output):
+            show_timeout(diagnostic, "PRIVATE\nESCAPE", "bad\x1b", ("bad\n",))
+        self.assertNotIn("PRIVATE", output.getvalue())
+        self.assertNotIn("\x1b", output.getvalue())
+        output = io.StringIO()
+        with redirect_stderr(output):
+            show_timeout(TimeoutDiagnostic("git_preflight", 0.123456789))
+        self.assertIn("Configured limit: 0.123456789 seconds", output.getvalue())
+        output.close()
+        with redirect_stderr(output):
+            show_timeout(diagnostic)  # Closed terminal does not prevent stopping.
+
+    def test_invalid_timeout_records_are_rejected(self):
+        for changes in ({"operation": "PRIVATE"}, {"classification": "SUCCESS"},
+                        {"configured_seconds": True}, {"configured_seconds": 0},
+                        {"configured_seconds": float("inf")}, {"configured_seconds": 10**1000},
+                        {"elapsed_seconds": -1}, {"elapsed_seconds": float("nan")}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                TimeoutDiagnostic(**({"operation": "review", "configured_seconds": 600} | changes))
 
 
 class OperationsLogTests(unittest.TestCase):

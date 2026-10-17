@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from auto_coding.cli import main
 from auto_coding.plan_freeze import load_frozen_plan, plan_fingerprint
 from auto_coding.plan_preflight import PlanPreflightResult
+from auto_coding.operations import TimeoutDiagnostic
 from test_plans import make_plan, make_v2_plan
 
 
@@ -252,10 +253,12 @@ class PlanCliTests(unittest.TestCase):
             self.assertIn("NOT READY", errors)
             self.assertNotIn("secret", errors)
 
-    def test_preflight_requires_explicit_positive_timeout_and_sha(self):
+    def test_preflight_defaults_git_timeout_and_requires_positive_override_and_sha(self):
         arguments = ["plan", "preflight", str(self.destination), "--approved-sha256", self.approval,
                      "--repository", str(self.repository)]
-        self.assertEqual(self.module(*arguments)[0], 2)
+        with patch("auto_coding.cli.preflight_frozen_plan", return_value=PlanPreflightResult(False, "GIT_FAILED")) as preflight:
+            self.assertEqual(self.direct(arguments)[0], 1)
+        self.assertEqual(preflight.call_args.args[-1], 120)
         for timeout in ("0", "-1", "nan", "inf", "PRIVATE_TIMEOUT"):
             status, output, errors = self.module(*arguments, "--git-timeout-seconds", timeout)
             self.assertEqual(status, 2)
@@ -360,6 +363,30 @@ class PlanCliRepositoryTests(unittest.TestCase):
 class RunCliTests(unittest.TestCase):
     """Real CLI orchestration and Git gates; only Codex/test adapters are fake."""
 
+    def test_default_git_timeout_preserves_explicit_frozen_limits(self):
+        args = self.args[:]
+        index = args.index("--git-timeout-seconds")
+        del args[index:index + 2]
+        frozen = self.frozen_path.read_bytes()
+        result = self.invoke(args)
+        self.assertEqual(result[0], 0, result)
+        self.assertEqual(self.execute_mock.call_args.args[4], 120)
+        self.assertEqual(self.a_calls[0][0][4], 11)
+        self.assertEqual(self.test_calls[0][0][2], 13)
+        self.assertEqual(self.b_calls[0][1]["timeout_seconds"], 12)
+        self.assertEqual(self.frozen_path.read_bytes(), frozen)
+        self.assertNotIn("TIMEOUT", result[1] + result[2])
+
+    def test_preflight_timeout_notice_does_not_create_execution_metadata(self):
+        failure = PlanPreflightResult(False, "GIT_TIMEOUT", batch_id=self.plan["batch_id"],
+                                      timeout=TimeoutDiagnostic("git_preflight", 5))
+        with patch("auto_coding.cli.preflight_frozen_plan", return_value=failure):
+            result = self.invoke()
+        self.assert_no_execution(result)
+        self.assertIn("AUTO-CODING STOPPED - TIMEOUT", result[2])
+        self.assertIn("Operation: Git preflight", result[2])
+        self.assertIn("Configured limit: 5 seconds", result[2])
+
     def setUp(self):
         import test_orchestrator as fixtures
         fixtures.OrchestratorTests.setUp(self)
@@ -435,7 +462,7 @@ class RunCliTests(unittest.TestCase):
 
     def test_required_approval_and_limits_are_argument_errors(self):
         for flag in ("--approved-sha256", "--repository", "--metadata-directory", "--repository-id",
-                     "--git-timeout-seconds", "--evidence-max-bytes", "--packet-max-bytes", "--report-max-bytes"):
+                     "--evidence-max-bytes", "--packet-max-bytes", "--report-max-bytes"):
             args = self.args[:]
             index = args.index(flag)
             del args[index:index + 2]

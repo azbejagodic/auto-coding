@@ -20,7 +20,7 @@ class FileScopeTests(unittest.TestCase):
         run.assert_called_once_with(
             ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
             cwd="repo", stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, shell=False, check=False, timeout=10,
+            stderr=subprocess.DEVNULL, shell=False, check=False, timeout=120,
         )
         return result
 

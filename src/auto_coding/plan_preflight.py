@@ -17,6 +17,7 @@ from auto_coding.git_publish import (
 )
 from auto_coding.plan_freeze import PlanIntegrityError, load_frozen_plan, plan_fingerprint
 from auto_coding.plans import PlanValidationError
+from auto_coding.operations import TimeoutDiagnostic
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,7 @@ class PlanPreflightResult:
     repository_directory: Path | None = None
     origin_url: str | None = None
     test_timeouts: tuple[tuple[str, int], ...] = ()
+    timeout: TimeoutDiagnostic | None = None
 
 
 def preflight_frozen_plan(
@@ -80,7 +82,9 @@ from the preceding verified publication. This never changes the approved plan.
         plan["expected_origin_url"], git_timeout_seconds,
     )
     if not git_state.passed:
-        return PlanPreflightResult(False, git_state.error_code)
+        return PlanPreflightResult(False, git_state.error_code, batch_id=plan["batch_id"],
+                                   timeout=TimeoutDiagnostic("git_preflight", git_timeout_seconds)
+                                   if git_state.error_code == "GIT_TIMEOUT" else None)
     try:
         repository = Path(repository_directory).resolve(strict=True)
         temporary = _external_temporary_directory(repository)
@@ -96,7 +100,9 @@ from the preceding verified publication. This never changes the approved plan.
             git_timeout_seconds, temporary, environment,
         )
         if error:
-            return PlanPreflightResult(False, error)
+            return PlanPreflightResult(False, error, batch_id=plan["batch_id"],
+                                       timeout=TimeoutDiagnostic("git_preflight", git_timeout_seconds)
+                                       if error == "GIT_TIMEOUT" else None)
         if code != 0:
             return PlanPreflightResult(False, "GIT_FAILED")
         if output:

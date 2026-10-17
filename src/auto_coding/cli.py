@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 from auto_coding.plan_freeze import PlanIntegrityError, freeze_approved_plan, load_frozen_plan, plan_fingerprint
 from auto_coding.plan_preflight import preflight_frozen_plan
 from auto_coding.plans import PlanValidationError, validate_plan
+from auto_coding.operations import show_timeout
 from auto_coding.orchestrator import (
     FirstTaskReviewResult, SingleTaskPublishResult, execute_first_task_through_review,
     export_stopped_batch_report, publish_single_task_batch, execute_sequential_batch, SequentialBatchResult,
@@ -134,6 +135,8 @@ def _run(args) -> int:
         print("PREFLIGHT")
         preflight = preflight_frozen_plan(frozen, args.approved_sha256, repository, args.git_timeout_seconds)
         if preflight.ready is not True or preflight.error_code is not None:
+            if preflight.timeout is not None:
+                show_timeout(preflight.timeout, preflight.batch_id)
             raise _CliFailure(_safe_code(preflight.error_code, "PREFLIGHT_FAILED"))
         plan = load_frozen_plan(frozen, args.approved_sha256)
         if plan["schema_version"] != 2:
@@ -147,6 +150,7 @@ def _run(args) -> int:
             if not isinstance(result, SequentialBatchResult):
                 raise _CliFailure("BATCH_RESULT_UNCERTAIN")
             complete = (result.outcome == "COMPLETED" and result.error_code is None
+                        and result.timeout is None
                         and result.checkpoint_error_code is None and result.report_error_code is None
                         and result.completed_task_ids == tuple(task["task_id"] for task in plan["tasks"])
                         and tuple(item[0] for item in result.publications) == result.completed_task_ids
@@ -176,7 +180,7 @@ def _run(args) -> int:
             args.evidence_max_bytes, args.packet_max_bytes,
         )
         if (not isinstance(handoff, FirstTaskReviewResult) or handoff.outcome != "READY_FOR_PUBLICATION"
-                or handoff.error_code is not None or handoff.checkpoint_error_code is not None):
+                or handoff.error_code is not None or handoff.checkpoint_error_code is not None or handoff.timeout is not None):
             stage = getattr(handoff, "stage", None)
             stage = stage if stage in ("preflight", "implementation", "evidence", "testing", "review", "publishing") else phase
             reason = _safe_code(getattr(handoff, "error_code", None), "REVIEW_HANDOFF_INVALID")
@@ -205,6 +209,7 @@ def _run(args) -> int:
             raise _CliFailure("PUBLICATION_RESULT_UNCERTAIN")
         complete = (
             result.outcome == "PUBLISHED_FINALIZED" and result.error_code is None
+            and result.timeout is None
             and result.checkpoint_error_code is None and result.report_error_code is None
             and result.published is True and result.checkpoint_finalized is True and result.reports_exported is True
             and result.staging_invoked is True and result.publishing_invoked is True
@@ -328,14 +333,14 @@ def _parser() -> argparse.ArgumentParser:
     preflight.add_argument("frozen_plan_path", help="frozen-plan path outside the target repository")
     preflight.add_argument("--approved-sha256", required=True, help="explicit approved fingerprint from an independent trusted source")
     preflight.add_argument("--repository", required=True, help="target Git working-tree root")
-    preflight.add_argument("--git-timeout-seconds", required=True, type=_positive_timeout, help="positive finite timeout for each read-only Git command")
+    preflight.add_argument("--git-timeout-seconds", default=120, type=_positive_timeout, help="positive finite timeout for each read-only Git command (default: 120)")
     run = commands.add_parser("run", help="execute, review and publish approved frozen tasks in order")
     run.add_argument("frozen_plan_path", help="approved schema-v2 frozen artifact outside the target repository")
     run.add_argument("--approved-sha256", required=True, type=_approval, help="explicit trusted approval fingerprint; never inferred")
     run.add_argument("--repository", required=True, help="target Git working-tree root")
     run.add_argument("--metadata-directory", required=True, help="existing external directory; no checkpoint or batch reports may exist")
     run.add_argument("--repository-id", required=True, type=_repository_id, help="owner/repository report label")
-    run.add_argument("--git-timeout-seconds", required=True, type=_run_timeout, help="per-command timeout, positive and at most 86400 seconds")
+    run.add_argument("--git-timeout-seconds", default=120, type=_run_timeout, help="per-command timeout, positive and at most 86400 seconds (default: 120)")
     for name in ("evidence", "packet", "report"):
         run.add_argument(f"--{name}-max-bytes", required=True, type=_run_bytes,
                          help="explicit byte limit, 1..67108864 (64 MiB)")
@@ -370,6 +375,8 @@ def main(argv: list[str] | None = None) -> int:
             result = preflight_frozen_plan(args.frozen_plan_path, args.approved_sha256,
                                            args.repository, args.git_timeout_seconds)
             if not result.ready:
+                if result.timeout is not None:
+                    show_timeout(result.timeout, result.batch_id)
                 code = result.error_code
                 if not isinstance(code, str) or not re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", code):
                     code = "PREFLIGHT_FAILED"
