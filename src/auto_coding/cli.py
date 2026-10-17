@@ -14,6 +14,9 @@ from auto_coding.plan_freeze import PlanIntegrityError, freeze_approved_plan, lo
 from auto_coding.plan_preflight import preflight_frozen_plan
 from auto_coding.plans import PlanValidationError, validate_plan
 from auto_coding.operations import show_timeout
+from auto_coding.continuation import (
+    ContinuationError, check_continuation_binding, inspect_continuation, prepare_continuation,
+)
 from auto_coding.orchestrator import (
     FirstTaskReviewResult, SingleTaskPublishResult, execute_first_task_through_review,
     export_stopped_batch_report, publish_single_task_batch, execute_sequential_batch, SequentialBatchResult,
@@ -141,6 +144,10 @@ def _run(args) -> int:
         plan = load_frozen_plan(frozen, args.approved_sha256)
         if plan["schema_version"] != 2:
             raise _CliFailure("PLAN_SCHEMA_NOT_RUNNABLE")
+        reference = check_continuation_binding(plan, args.approved_sha256, repository, metadata)
+        if reference is not None:
+            print("MANUAL CONTINUATION of batch " + json.dumps(reference["source_batch_id"])
+                  + "; prepared base: " + reference["base_sha"])
         if len(plan["tasks"]) > 1:
             phase = "execution"
             print("SEQUENTIAL IMPLEMENTATION / TESTS / REVIEW / PUBLICATION")
@@ -236,7 +243,7 @@ def _run(args) -> int:
                 print(f"{label}: {sha}")
         _show_paths(checkpoint, metadata, result)
         return 0 if complete else 1
-    except _CliFailure as error:
+    except (_CliFailure, ContinuationError) as error:
         reason = _safe_code(str(error), "RUN_FAILED")
     except (PlanIntegrityError, PlanValidationError):
         reason = "PLAN_INVALID_OR_UNAPPROVED"
@@ -310,6 +317,62 @@ def _summary(plan: dict, fingerprint: str) -> None:
         print("Task: " + json.dumps(task["task_id"], ensure_ascii=True) + suffix)
 
 
+def _continuation(args):
+    values = (args.source_plan, args.source_approved_sha256, args.source_metadata, args.repository)
+    if args.continuation_action == "inspect":
+        info = inspect_continuation(*values, args.git_timeout_seconds, args.report_max_bytes)
+        preparation = None
+    else:
+        preparation = prepare_continuation(
+            *values, args.plan, args.destination, args.metadata_directory,
+            git_timeout_seconds=args.git_timeout_seconds, report_max_bytes=args.report_max_bytes, dry_run=args.dry_run)
+        info = preparation.inspection
+    print("Source batch: " + json.dumps(info.batch_id, ensure_ascii=True))
+    print("Source status: " + json.dumps(info.status))
+    print("Published tasks: " + json.dumps(info.published_task_ids))
+    label = "Verified continuation base" if info.safe else "Recorded base (not currently verified)"
+    print(label + ": " + json.dumps(info.base_sha))
+    print("Stopped task: " + json.dumps(info.stopped_task_id) + "; reason: " + json.dumps(info.stop_reason_code))
+    print("Reported reviewer decision: " + json.dumps(info.reported_review_decision))
+    if info.batch_id is not None:
+        print("Original review details: " + json.dumps(str(Path(args.source_metadata) / "batch-report.md"), ensure_ascii=True))
+    print("Never started: " + json.dumps(info.never_started_task_ids))
+    print("Execution unavailable: " + json.dumps(info.unknown_task_ids))
+    if not info.safe:
+        print("CONTINUATION STOPPED: " + _safe_code(info.error_code, "SOURCE_UNVERIFIED"), file=sys.stderr)
+        print({"REMOTE_HEAD_MISMATCH": "The source remote changed; investigate before continuing.",
+               "HEAD_MISMATCH": "The source HEAD differs from the recorded base; investigate without resetting it.",
+               "SOURCE_PUBLICATION_AMBIGUOUS": "A commit/push outcome is uncertain; no continuation is authorized.",
+               "SOURCE_PROCESS_CLEANUP_UNCERTAIN": "Process cleanup was not verified; investigate remaining processes.",
+               "SOURCE_EXECUTION_UNCERTAIN": "Execution observations are incomplete; manual investigation is required.",
+               "GIT_TIMEOUT": f"Git exceeded its configured {args.git_timeout_seconds:g}-second limit."}.get(
+                   info.error_code, "Required metadata or Git verification failed; preserve the stopped run and investigate."),
+              file=sys.stderr)
+        return 1
+    if info.baseline_only:
+        print("No tasks were published. A fresh approved plan can start from this verified original baseline.")
+    if preparation is None:
+        print("SAFE TO PREPARE A SEPARATE CONTINUATION (snapshot; not a lock)")
+        return 0
+    if preparation.error_code is not None:
+        print("PREPARATION STOPPED: " + _safe_code(preparation.error_code, "PREPARATION_UNVERIFIED"), file=sys.stderr)
+        for label, path in (("New repository candidate", preparation.repository), ("New metadata candidate", preparation.metadata_directory)):
+            if path is not None:
+                print(label + ": " + json.dumps(str(path), ensure_ascii=True))
+        print("New paths, if created, were preserved; inspect them manually before taking further action.")
+        return 1
+    print("DRY RUN - NO PATHS CREATED" if preparation.dry_run else "PREPARED - NOT APPROVED OR EXECUTED")
+    for label, value in (("New batch", preparation.new_batch_id), ("New branch", preparation.branch),
+                         ("Fresh repository", str(preparation.repository)),
+                         ("New metadata", str(preparation.metadata_directory))):
+        print(label + ": " + json.dumps(value, ensure_ascii=True))
+    print("Proposed plan SHA-256 (not approval): " + preparation.plan_sha256)
+    print("Next: explicitly publish the new branch from the fresh clone; review the complete new plan;")
+    print("supply its OWN approved SHA-256 to plan freeze, then use plan preflight and run with the new metadata.")
+    print("The stopped repository and execution metadata are preserved. No original approval is reused.")
+    return 0
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = _Parser(
         prog="auto-coding", description="Auto-Coding v1: approved plans and sequential task execution",
@@ -344,6 +407,21 @@ def _parser() -> argparse.ArgumentParser:
     for name in ("evidence", "packet", "report"):
         run.add_argument(f"--{name}-max-bytes", required=True, type=_run_bytes,
                          help="explicit byte limit, 1..67108864 (64 MiB)")
+    continuation = commands.add_parser("continuation", help="inspect a stopped batch or prepare a separate fresh continuation")
+    continuation_actions = continuation.add_subparsers(dest="continuation_action", required=True)
+    for name in ("inspect", "prepare"):
+        action = continuation_actions.add_parser(name)
+        action.add_argument("--source-plan", required=True, help="original immutable frozen schema-v2 plan")
+        action.add_argument("--source-approved-sha256", required=True, type=_approval, help="original independently confirmed approval")
+        action.add_argument("--source-metadata", required=True, help="stopped sequential batch metadata directory")
+        action.add_argument("--repository", required=True, help="original stopped repository root; never modified")
+        action.add_argument("--git-timeout-seconds", default=120, type=_run_timeout)
+        action.add_argument("--report-max-bytes", default=2097152, type=_run_bytes)
+        if name == "prepare":
+            action.add_argument("--plan", required=True, help="new proposed schema-v2 plan; never rewritten or approved here")
+            action.add_argument("--destination", required=True, help="nonexistent fresh clone directory; parent must exist")
+            action.add_argument("--metadata-directory", required=True, help="nonexistent external metadata directory; parent must exist")
+            action.add_argument("--dry-run", action="store_true", help="verify preparation inputs without creating paths")
     return parser
 
 
@@ -351,6 +429,12 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.command is None:
         return 0  # Preserve the original no-argument entry-point behavior.
+    if args.command == "continuation":
+        try:
+            return _continuation(args)
+        except (Exception, KeyboardInterrupt):
+            print("CONTINUATION STOPPED: INPUT_OR_IO_FAILED", file=sys.stderr)
+            return 1
     if args.command == "run":
         return _run(args)
     try:

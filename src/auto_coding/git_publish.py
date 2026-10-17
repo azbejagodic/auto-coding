@@ -105,7 +105,7 @@ def check_publish_preflight(
 
 def _check_publish_state(
     repository_directory, expected_branch, expected_head, expected_origin_url, timeout_seconds,
-    *, allow_staged=False, expected_remote_head=None,
+    *, allow_staged=False, expected_remote_head=None, remote_branch=None,
 ):
     try:
         valid_timeout = (
@@ -119,6 +119,8 @@ def _check_publish_state(
         return GitPreflightResult(False, "INVALID_TIMEOUT")
     try:
         _branch(expected_branch)
+        if remote_branch is not None:
+            _branch(remote_branch)
         if (not isinstance(expected_head, str) or not _SHA.fullmatch(expected_head)
                 or not isinstance(expected_origin_url, str) or not expected_origin_url.strip()
                 or any(character in expected_origin_url for character in "\r\n\0")):
@@ -205,13 +207,13 @@ def _check_publish_state(
         if code == 1 and not allow_staged:
             return GitPreflightResult(False, "STAGED_CHANGES")
         remote, error = query(
-            ["ls-remote", "--exit-code", "--refs", "origin", f"refs/heads/{expected_branch}"],
+            ["ls-remote", "--exit-code", "--refs", "origin", f"refs/heads/{remote_branch or expected_branch}"],
         )
         if error:
             return GitPreflightResult(False, error)
         fields = remote.split("\t")
         if (len(fields) != 2 or not _SHA.fullmatch(fields[0])
-                or fields[1] != f"refs/heads/{expected_branch}"):
+                or fields[1] != f"refs/heads/{remote_branch or expected_branch}"):
             return GitPreflightResult(False, "MALFORMED_GIT_OUTPUT")
         if fields[0].lower() != (expected_remote_head or expected_head).lower():
             return GitPreflightResult(False, "REMOTE_HEAD_MISMATCH")

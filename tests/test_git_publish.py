@@ -21,6 +21,18 @@ from auto_coding.test_runner import TestCommandResult, TestRunResult, _command_i
 
 
 class GitPreflightTests(unittest.TestCase):
+    def test_preparation_can_verify_an_explicit_source_ref_without_relaxing_default_gate(self):
+        new_branch = "feature/continued"
+        self.responses[("symbolic-ref", "--quiet", "HEAD")] = (0, f"refs/heads/{new_branch}\n".encode())
+        self.responses[("ls-remote", "--exit-code", "--refs", "origin", f"refs/heads/{new_branch}")] = (2, b"")
+        with patch("auto_coding.git_publish.subprocess.run", side_effect=self.execute):
+            prepared = git_publish._check_publish_state(self.repository, new_branch, self.head, self.origin,
+                                                       3, remote_branch=self.branch)
+        self.assertTrue(prepared.passed, prepared)
+        self.assertEqual(self.calls[-1], self.remote_args)
+        # Normal preflight still requires the active NEW remote branch itself.
+        self.assertEqual(self.check(expected_branch=new_branch).error_code, "GIT_FAILED")
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
