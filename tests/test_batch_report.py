@@ -140,6 +140,25 @@ class BatchReportTests(unittest.TestCase):
         self.assertIn(b"# Auto-Coding batch report", report.markdown_bytes)
         self.assertIn(_COMMIT.encode(), report.markdown_bytes)
 
+    def test_sequential_partial_report_binds_completed_commits_to_durable_ledger(self):
+        first, second = task(), stopped_task()
+        second["task_id"] = "task-2"
+        state = dict(checkpoint("stopped"), schema_version=2, current_task_id="task-2",
+                     implementer_session_id=None, reviewer_session_id=None, task_ids=["task-1", "task-2"],
+                     current_head=_COMMIT, publications=[dict(task_id="task-1", starting_head="b" * 40,
+                     commit_sha=_COMMIT, remote_sha=_COMMIT, finalized=True)])
+        data = json.loads(self.build([first, second], state).json_bytes)
+        self.assertEqual(data["batch"]["completed_tasks"], 1)
+        self.assertEqual(data["batch"]["stopped_tasks"], 1)
+        self.assertEqual(data["checkpoint"]["base_head"], "b" * 40)
+        self.assertEqual(data["checkpoint"]["publications"][0]["commit_sha"], _COMMIT)
+        wrong = deepcopy(first)
+        wrong["publishing"].update(commit_sha="d" * 40, remote_sha="d" * 40, observed_head_sha="d" * 40)
+        with self.assertRaises(BatchReportError):
+            self.build([wrong, second], state)
+        with self.assertRaises(BatchReportError):
+            self.build([second, first], state)
+
     def test_stopped_batch_records_failure_and_partial_task_without_success(self):
         report = self.build([stopped_task()], checkpoint("stopped"))
         data = json.loads(report.json_bytes)

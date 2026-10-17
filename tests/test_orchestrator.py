@@ -1022,5 +1022,471 @@ class StoppedBatchReportTests(unittest.TestCase):
         self.assertEqual(self.checkpoint_path.read_bytes(), checkpoint)
 
 
+class SequentialBatchTests(unittest.TestCase):
+    git = OrchestratorTests.git
+    run_tests_fake = OrchestratorTests.run_tests_fake
+
+    def setUp(self):
+        OrchestratorTests.setUp(self)
+        template = deepcopy(self.plan["tasks"][0])
+        self.plan["tasks"] = []
+        for index in range(1, 4):
+            task = deepcopy(template)
+            task.update(task_id=f"task-{index}", order=index,
+                        depends_on=[] if index == 1 else [f"task-{index-1}"],
+                        permitted_files=[f"file-{index}.txt"], acceptance_criteria=[f"Criterion {index}"],
+                        test_commands=[[f"frozen-test-{index}", f"PRIVATE_ARG_{index}"]])
+            task["implementation"].update(prompt=f"PRIVATE_IMPLEMENT_{index}",
+                                           model=("gpt-6-sol", "gpt-6.1-sol", "gpt-6-sol")[index-1],
+                                           reasoning_effort=("low", "medium", "high")[index-1])
+            task["review"].update(prompt=f"PRIVATE_REVIEW_{index}", reasoning_effort=("high", "medium", "low")[index-1])
+            task["limits"].update(implementation_seconds=10 + index, test_seconds=20 + index, review_seconds=30 + index)
+            self.plan["tasks"].append(task)
+        self.metadata = self.parent / "Sequential Metadata"
+        self.metadata.mkdir()
+        self.active = 0
+        self.observed_heads, self.stage_calls, self.publish_calls = [], [], []
+        self.configure(3)
+
+    def configure(self, count):
+        self.plan["tasks"] = self.plan["tasks"][:count]
+        self.frozen_path.unlink()
+        self.approval = plan_fingerprint(self.plan)
+        freeze_approved_plan(self.plan, self.approval, self.frozen_path)
+        self.frozen_bytes = self.frozen_path.read_bytes()
+
+    @staticmethod
+    def session(index, role):
+        return f"{index * 2 + role:08x}-1111-4111-8111-111111111111"
+
+    def implement(self, *args, **kwargs):
+        self.active += 1
+        self.a_calls.append((args, kwargs))
+        self.observed_heads.append(self.git("rev-parse", "HEAD").decode().strip())
+        self.assertEqual(self.git("status", "--porcelain"), b"")
+        (self.repository / f"file-{self.active}.txt").write_bytes(f"content {self.active}\n".encode())
+        return replace(self.a_result, session_id=self.session(self.active, 0))
+
+    def review(self, *args, **kwargs):
+        self.b_calls.append((args, kwargs))
+        packet = build_review_packet(*args)
+        return ReviewResult(True, ReviewVerdict("APPROVED", (), (), tuple(args[1]), "HIGH"), None,
+                            0, False, "not_needed", self.session(self.active, 1),
+                            hashlib.sha256(packet).hexdigest(), args[0].fingerprint)
+
+    def run_batch(self, implement=None, tests=None, review=None, **changes):
+        values = dict(frozen_plan_path=self.frozen_path, approved_sha256=self.approval,
+                      repository_directory=self.repository, metadata_directory=self.metadata,
+                      repository_identifier="example/sequential", git_timeout_seconds=5,
+                      evidence_max_bytes=100000, packet_max_bytes=200000, report_max_bytes=200000)
+        def stage(*args, **kwargs):
+            self.stage_calls.append(args)
+            return stage_reviewed_changes(*args, **kwargs)
+        def publish(*args, **kwargs):
+            self.publish_calls.append(args)
+            return publish_reviewed_changes(*args, **kwargs)
+        with patch("auto_coding.orchestrator.run_implementation", side_effect=implement or self.implement), \
+             patch("auto_coding.orchestrator.run_approved_tests", side_effect=tests or self.run_tests_fake), \
+             patch("auto_coding.orchestrator.run_review_packet", side_effect=review or self.review), \
+             patch("auto_coding.orchestrator.stage_reviewed_changes", side_effect=stage), \
+             patch("auto_coding.orchestrator.publish_reviewed_changes", side_effect=publish):
+            return orchestrator.execute_sequential_batch(**(values | changes))
+
+    def data(self):
+        return json.loads((self.metadata / "batch-report.json").read_bytes())
+
+    def checkpoint(self):
+        return load_checkpoint(self.metadata / "batch-checkpoint.json")
+
+    def assert_success(self, result, count):
+        self.assertEqual(result.outcome, "COMPLETED", result)
+        self.assertIsNone(result.error_code)
+        self.assertEqual(len(result.completed_task_ids), count)
+        self.assertEqual(len(self.a_calls), count)
+        self.assertEqual(len(self.test_calls), count)
+        self.assertEqual(len(self.b_calls), count)
+        self.assertEqual(len(self.stage_calls), count)
+        self.assertEqual(len(self.publish_calls), count)
+        commits = [entry[1] for entry in result.publications]
+        self.assertEqual(self.observed_heads, [self.head, *commits[:-1]])
+        self.assertEqual([args[2] for args in self.stage_calls], self.observed_heads)
+        self.assertEqual([args[2] for args in self.publish_calls], self.observed_heads)
+        self.assertEqual(self.checkpoint()["base_head"], self.head)
+        self.assertEqual(self.checkpoint()["current_head"], commits[-1])
+        self.assertEqual(self.checkpoint()["status"], "completed")
+        self.assertEqual(self.git("ls-remote", "origin", f"refs/heads/{self.branch}").decode().split()[0], commits[-1])
+        self.assertEqual(self.git("status", "--porcelain"), b"")
+        self.assertEqual(self.git("rev-list", "--count", f"{self.head}..HEAD").decode().strip(), str(count))
+        self.assertEqual(self.frozen_path.read_bytes(), self.frozen_bytes)
+        report = self.data()
+        self.assertEqual(report["batch"]["completed_tasks"], count)
+        self.assertTrue((self.metadata / "batch-report.md").is_file())
+        for index, task in enumerate(self.plan["tasks"]):
+            self.assertEqual(self.a_calls[index], ((task["implementation"]["prompt"], task["implementation"]["model"],
+                             task["implementation"]["reasoning_effort"], self.repository, task["limits"]["implementation_seconds"]), {"session_id": None}))
+            self.assertEqual(self.test_calls[index], ((self.repository, task["test_commands"], task["limits"]["test_seconds"]), {}))
+            args, options = self.b_calls[index]
+            self.assertEqual(args[1:3], (task["acceptance_criteria"], task["test_commands"]))
+            self.assertEqual(options["review_prompt"], task["review"]["prompt"])
+            self.assertEqual(options["model"], task["review"]["model"])
+            self.assertEqual(options["reasoning_effort"], task["review"]["reasoning_effort"])
+            self.assertEqual(options["timeout_seconds"], task["limits"]["review_seconds"])
+            self.assertIsNone(options["session_id"])
+            self.assertEqual(report["tasks"][index]["evidence"]["changed_paths"], task["permitted_files"])
+            child = load_checkpoint(self.metadata / f"task-{index+1:04d}" / "batch-checkpoint.json")
+            self.assertEqual(child["base_head"], self.observed_heads[index])
+            self.assertEqual(child["status"], "completed")
+            self.assertEqual(report["tasks"][index]["publishing"]["commit_sha"], commits[index])
+        text = (self.metadata / "batch-report.json").read_text() + (self.metadata / "batch-report.md").read_text(encoding="utf-8")
+        for private in ("PRIVATE_IMPLEMENT", "PRIVATE_REVIEW", "PRIVATE_ARG", "tracked_diff_base64"):
+            self.assertNotIn(private, text)
+
+    def test_two_tasks_publish_in_order_at_verified_successive_heads(self):
+        self.configure(2)
+        self.assert_success(self.run_batch(), 2)
+
+    def test_three_tasks_publish_with_independent_frozen_settings(self):
+        self.assert_success(self.run_batch(), 3)
+
+    def test_later_deleted_context_uses_previous_task_commit_not_batch_base(self):
+        self.configure(2)
+        self.plan["tasks"][1]["permitted_files"] = ["file-1.txt"]
+        self.configure(2)
+        def implement(*args, **kwargs):
+            if self.active == 0:
+                return self.implement(*args, **kwargs)
+            self.active += 1
+            self.a_calls.append((args, kwargs))
+            self.observed_heads.append(self.git("rev-parse", "HEAD").decode().strip())
+            (self.repository / "file-1.txt").unlink()
+            return replace(self.a_result, session_id=self.session(2, 0))
+        result = self.run_batch(implement=implement)
+        self.assert_success(result, 2)
+        self.assertEqual(self.b_calls[1][0][4], [("file-1.txt", b"content 1\n")])
+        self.assertIn(b"deleted file mode", self.b_calls[1][0][0].tracked_diff)
+
+    def test_one_task_also_supported_by_sequential_entry_point(self):
+        self.configure(1)
+        self.assert_success(self.run_batch(), 1)
+
+    def test_failure_at_first_implementation_stops_all_later_execution(self):
+        def implement(*args, **kwargs):
+            result = self.implement(*args, **kwargs)
+            return replace(result, succeeded=False, exit_status=1, report=None, error_code="CODEX_FAILED")
+        result = self.run_batch(implement=implement)
+        self.assertEqual(result.outcome, "STOPPED", result)
+        self.assertEqual(result.error_code, "CODEX_FAILED")
+        self.assertEqual(len(self.a_calls), 1)
+        self.assertEqual(self.test_calls, [])
+        self.assertEqual(self.b_calls, [])
+        self.assertEqual(self.stage_calls, [])
+        self.assertEqual(self.publish_calls, [])
+        self.assertEqual([task["status"] for task in self.data()["tasks"]], ["stopped", "pending", "pending"])
+        self.assertEqual(self.checkpoint()["publications"], [])
+
+    def test_later_failed_tests_preserve_first_publication_and_partial_report(self):
+        def tests(*args, **kwargs):
+            result = self.run_tests_fake(*args, **kwargs)
+            return result if self.active == 1 else replace(result, passed=False, first_failed_index=1,
+                  command_results=(replace(result.command_results[0], exit_status=1),))
+        result = self.run_batch(tests=tests)
+        self.assertEqual(result.outcome, "PARTIALLY_COMPLETED", result)
+        self.assertEqual(result.error_code, "TESTS_NOT_PASSED")
+        self.assertEqual((len(self.a_calls), len(self.test_calls), len(self.b_calls)), (2, 2, 1))
+        self.assertEqual((len(self.stage_calls), len(self.publish_calls)), (1, 1))
+        self.assertEqual(self.checkpoint()["current_task_id"], "task-2")
+        self.assertEqual(self.checkpoint()["base_head"], self.head)
+        self.assertEqual(self.checkpoint()["current_head"], result.publications[0][1])
+        self.assertEqual(self.git("rev-parse", "HEAD").decode().strip(), result.publications[0][1])
+        self.assertEqual([task["status"] for task in self.data()["tasks"]], ["completed", "stopped", "pending"])
+        self.assertIsNone(self.data()["tasks"][1]["review"])
+        self.assertTrue((self.repository / "file-2.txt").exists())
+
+    def test_later_implementation_failure_preserves_previous_commit(self):
+        def implement(*args, **kwargs):
+            result = self.implement(*args, **kwargs)
+            return result if self.active == 1 else replace(result, succeeded=False, exit_status=1,
+                                                          report=None, error_code="CODEX_FAILED")
+        result = self.run_batch(implement=implement)
+        self.assertEqual(result.completed_task_ids, ("task-1",))
+        self.assertEqual(result.error_code, "CODEX_FAILED", result)
+        self.assertEqual((len(self.a_calls), len(self.test_calls), len(self.b_calls)), (2, 1, 1))
+        self.assertIsNone(self.data()["tasks"][1]["terminal_results"])
+        self.assertEqual(self.data()["tasks"][2]["status"], "pending")
+
+    def test_later_timeout_stops_before_review_and_next_task(self):
+        def tests(*args, **kwargs):
+            result = self.run_tests_fake(*args, **kwargs)
+            return result if self.active == 1 else replace(result, passed=False, first_failed_index=1,
+                  command_results=(replace(result.command_results[0], exit_status=None, timed_out=True,
+                                           cleanup_result="taskkill_completed"),))
+        result = self.run_batch(tests=tests)
+        self.assertEqual(result.error_code, "TEST_TIMEOUT", result)
+        self.assertEqual((len(self.a_calls), len(self.b_calls)), (2, 1))
+        self.assertTrue(self.data()["tasks"][1]["terminal_results"]["command_results"][0]["timed_out"])
+
+    def _fail_later_publication(self, action, *, ambiguous=False):
+        query = git_publish._git_query
+        failures = []
+        def fail(repository, arguments, *args, **kwargs):
+            if self.active == 2 and arguments[0] == action:
+                failures.append(arguments)
+                if ambiguous:
+                    result = query(repository, arguments, *args, **kwargs)
+                    self.assertEqual((result[0], result[2]), (0, None))
+                    return None, None, "GIT_TIMEOUT"
+                return 1, b"", None
+            return query(repository, arguments, *args, **kwargs)
+        with patch("auto_coding.git_publish._git_query", side_effect=fail):
+            result = self.run_batch()
+        self.assertEqual(result.outcome, "PARTIALLY_COMPLETED", result)
+        self.assertEqual(result.completed_task_ids, ("task-1",))
+        self.assertEqual(len(self.a_calls), 2)
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(self.data()["tasks"][0]["status"], "completed")
+        self.assertEqual(self.data()["tasks"][1]["status"], "stopped")
+        self.assertEqual(self.data()["tasks"][2]["status"], "pending")
+        self.assertEqual(self.checkpoint()["current_head"], result.publications[0][1])
+        return self.data()["tasks"][1]["publishing"]
+
+    def test_later_commit_failure_stops_without_push_or_retry(self):
+        result = self._fail_later_publication("commit")
+        self.assertEqual(result["outcome"], "COMMIT_FAILED_OR_AMBIGUOUS")
+        self.assertFalse(result["push_attempted"])
+        self.assertNotEqual(self.git("diff", "--cached"), b"")
+
+    def test_later_push_failure_preserves_actual_local_commit(self):
+        result = self._fail_later_publication("push")
+        self.assertEqual(result["outcome"], "PUSH_FAILED_OR_AMBIGUOUS")
+        self.assertEqual(self.git("rev-parse", "HEAD").decode().strip(), result["commit_sha"])
+        self.assertNotEqual(result["commit_sha"], self.checkpoint()["current_head"])
+
+    def test_later_ambiguous_push_is_not_retried_even_if_remote_updated(self):
+        result = self._fail_later_publication("push", ambiguous=True)
+        self.assertEqual(result["outcome"], "PUSH_FAILED_OR_AMBIGUOUS")
+        remote = self.git("ls-remote", "origin", f"refs/heads/{self.branch}").decode().split()[0]
+        self.assertEqual(remote, result["commit_sha"])
+        self.assertNotEqual(remote, self.checkpoint()["current_head"])
+
+    def test_later_uncertain_review_never_stages_or_starts_next(self):
+        def review(*args, **kwargs):
+            result = self.review(*args, **kwargs)
+            return result if self.active == 1 else replace(result, approved=False,
+                verdict=replace(result.verdict, decision="UNCERTAIN", blocking_issues=("Missing evidence",)),
+                reviewed_packet_sha256=None, reviewed_evidence_fingerprint=None)
+        result = self.run_batch(review=review)
+        self.assertEqual(result.error_code, "REVIEW_NOT_APPROVED", result)
+        self.assertEqual((len(self.a_calls), len(self.b_calls), len(self.stage_calls)), (2, 2, 1))
+        self.assertEqual(self.data()["tasks"][1]["review"]["model_verdict"]["decision"], "UNCERTAIN")
+
+    def test_later_scope_cannot_include_files_approved_only_for_earlier_task(self):
+        def implement(*args, **kwargs):
+            result = self.implement(*args, **kwargs)
+            if self.active == 2:
+                (self.repository / "file-1.txt").write_bytes(b"unauthorized later change")
+            return result
+        result = self.run_batch(implement=implement)
+        self.assertEqual(result.error_code, "OUT_OF_SCOPE", result)
+        self.assertEqual((len(self.a_calls), len(self.test_calls), len(self.publish_calls)), (2, 1, 1))
+        self.assertEqual((self.repository / "file-1.txt").read_bytes(), b"unauthorized later change")
+
+    def test_dirty_state_created_between_tasks_stops_before_next_implementation(self):
+        update = orchestrator.update_checkpoint
+        def mutate(path, state, **kwargs):
+            result = update(path, state, **kwargs)
+            if state["schema_version"] == 2 and state["current_task_id"] == "task-2" and state["status"] == "running":
+                (self.repository / "foreign.txt").write_bytes(b"external mutation")
+            return result
+        with patch("auto_coding.orchestrator.update_checkpoint", side_effect=mutate):
+            result = self.run_batch()
+        self.assertEqual(result.error_code, "WORKTREE_NOT_CLEAN", result)
+        self.assertEqual(result.outcome, "PARTIALLY_COMPLETED")
+        self.assertEqual(result.stage, "preflight")
+        self.assertIsNone(result.report_error_code)
+        self.assertEqual(result.completed_task_ids, ("task-1",))
+        self.assertEqual((len(self.a_calls), len(self.test_calls), len(self.b_calls),
+                          len(self.stage_calls), len(self.publish_calls)), (1, 1, 1, 1, 1))
+        report = self.data()
+        current = report["tasks"][1]
+        self.assertIs(current["implementation_started"], False)
+        self.assertIs(current["review_started"], False)
+        self.assertEqual(current["status"], "stopped")
+        for field in ("implementation", "evidence", "terminal_results", "review", "staging", "publishing"):
+            self.assertIsNone(current[field], field)
+        self.assertEqual(report["tasks"][0]["status"], "completed")
+        self.assertEqual(report["tasks"][2]["status"], "pending")
+        checkpoint = self.checkpoint()
+        self.assertEqual(checkpoint["status"], "stopped")
+        self.assertEqual(checkpoint["current_task_id"], "task-2")
+        self.assertEqual(len(checkpoint["publications"]), 1)
+        self.assertIs(checkpoint["publications"][0]["finalized"], True)
+        commit = result.publications[0][1]
+        self.assertEqual(self.git("rev-parse", "HEAD").decode().strip(), commit)
+        self.assertEqual(self.git("ls-remote", "origin", f"refs/heads/{self.branch}").decode().split()[0], commit)
+        self.assertEqual(self.git("rev-list", "--count", f"{self.head}..HEAD").decode().strip(), "1")
+        self.assertFalse((self.repository / "file-2.txt").exists())
+        self.assertEqual((self.repository / "foreign.txt").read_bytes(), b"external mutation")
+
+    def test_modified_frozen_plan_between_tasks_cannot_be_reapproved_implicitly(self):
+        update = orchestrator.update_checkpoint
+        def mutate(path, state, **kwargs):
+            result = update(path, state, **kwargs)
+            if state["schema_version"] == 2 and state["current_task_id"] == "task-2" and state["status"] == "running":
+                self.frozen_path.write_bytes(self.frozen_bytes + b" ")
+            return result
+        with patch("auto_coding.orchestrator.update_checkpoint", side_effect=mutate):
+            result = self.run_batch()
+        self.assertNotEqual(result.outcome, "COMPLETED")
+        self.assertEqual(len(self.a_calls), 1)
+        self.assertEqual(len(self.publish_calls), 1)
+
+    def test_batch_checkpoint_write_failure_stops_without_retry(self):
+        update = orchestrator.update_checkpoint
+        failures = []
+        def fail(path, state, **kwargs):
+            if state["schema_version"] == 2 and state["publications"]:
+                failures.append(state)
+                raise OSError("PRIVATE_ERROR")
+            return update(path, state, **kwargs)
+        with patch("auto_coding.orchestrator.update_checkpoint", side_effect=fail):
+            result = self.run_batch()
+        self.assertEqual(result.error_code, "BATCH_CHECKPOINT_WRITE_FAILED")
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(len(self.a_calls), 1)
+        self.assertEqual(len(result.publications), 1)
+        self.assertEqual(load_checkpoint(self.metadata / "task-0001" / "batch-checkpoint.json")["status"], "completed")
+        self.assertTrue((self.metadata / "task-0001" / "batch-report.json").exists())
+
+    def test_interrupted_task_call_reports_unknown_execution_without_starting_next(self):
+        def interrupt(*args, **kwargs):
+            self.implement(*args, **kwargs)
+            raise KeyboardInterrupt()
+        result = self.run_batch(implement=interrupt)
+        self.assertEqual(result.error_code, "BATCH_INTERRUPTED_STATE_UNCERTAIN", result)
+        self.assertEqual(len(self.a_calls), 1)
+        self.assertEqual(self.test_calls, [])
+        self.assertEqual(self.b_calls, [])
+        self.assertEqual(self.publish_calls, [])
+        current = self.data()["tasks"][0]
+        self.assertIsNone(current["implementation_started"])
+        self.assertIsNone(current["implementation"])
+        self.assertIsNone(current["publishing"])
+        self.assertEqual(self.data()["tasks"][1]["status"], "pending")
+        self.assertTrue((self.repository / "file-1.txt").exists())
+
+    def test_interrupted_batch_write_after_actual_update_is_never_retried(self):
+        update = orchestrator.update_checkpoint
+        interruptions = []
+        def interrupt(path, state, **kwargs):
+            value = update(path, state, **kwargs)
+            if state["schema_version"] == 2 and state["publications"]:
+                interruptions.append(state)
+                raise KeyboardInterrupt()
+            return value
+        with patch("auto_coding.orchestrator.update_checkpoint", side_effect=interrupt):
+            result = self.run_batch()
+        self.assertEqual(result.error_code, "BATCH_CHECKPOINT_WRITE_FAILED", result)
+        self.assertEqual(len(interruptions), 1)
+        self.assertEqual(len(self.a_calls), 1)
+        self.assertEqual(len(self.checkpoint()["publications"]), 1)
+        self.assertEqual(self.checkpoint()["current_task_id"], "task-2")
+        self.assertTrue((self.metadata / "task-0001" / "batch-report.json").exists())
+
+    def test_per_task_checkpoint_finalization_failure_retains_verified_publication(self):
+        update = orchestrator.update_checkpoint
+        def fail(path, state, **kwargs):
+            if state["schema_version"] == 1 and state["status"] == "completed":
+                raise OSError("PRIVATE_ERROR")
+            return update(path, state, **kwargs)
+        with patch("auto_coding.orchestrator.update_checkpoint", side_effect=fail):
+            result = self.run_batch()
+        self.assertEqual(len(self.a_calls), 1)
+        self.assertEqual(result.error_code, "CHECKPOINT_FINALIZATION_FAILED", result)
+        self.assertEqual(len(result.publications), 1)
+        self.assertEqual(self.checkpoint()["publications"][0]["finalized"], False)
+        self.assertEqual(self.data()["tasks"][0]["publishing"]["outcome"], "PUBLISHED")
+        self.assertEqual(self.data()["tasks"][0]["status"], "stopped")
+
+    def test_per_task_report_failure_stops_with_verified_commit_in_batch_report(self):
+        export = orchestrator.export_batch_report
+        def fail(*args, **kwargs):
+            if Path(kwargs["destination"]).name == "task-0001":
+                raise OSError("PRIVATE_ERROR")
+            return export(*args, **kwargs)
+        with patch("auto_coding.orchestrator.export_batch_report", side_effect=fail):
+            result = self.run_batch()
+        self.assertEqual(len(self.a_calls), 1)
+        self.assertEqual(result.error_code, "REPORT_UNAVAILABLE", result)
+        self.assertEqual(self.checkpoint()["publications"][0]["finalized"], False)
+        self.assertEqual(self.data()["tasks"][0]["publishing"]["commit_sha"], result.publications[0][1])
+        self.assertEqual(self.data()["tasks"][1]["status"], "pending")
+
+    def test_final_batch_report_failure_keeps_all_published_tasks_and_completion(self):
+        export = orchestrator.export_batch_report
+        def fail(*args, **kwargs):
+            if Path(kwargs["destination"]) == self.metadata:
+                raise OSError("PRIVATE_ERROR")
+            return export(*args, **kwargs)
+        with patch("auto_coding.orchestrator.export_batch_report", side_effect=fail):
+            result = self.run_batch()
+        self.assertNotEqual(result.outcome, "COMPLETED")
+        self.assertEqual(len(result.completed_task_ids), 3)
+        self.assertEqual(len(result.publications), 3)
+        self.assertEqual(self.checkpoint()["status"], "completed")
+        self.assertEqual(result.report_error_code, "REPORT_UNAVAILABLE")
+        self.assertTrue((self.metadata / "task-0003" / "batch-report.json").exists())
+
+    def test_invalid_approval_or_small_report_budget_prevents_all_codex_calls(self):
+        for changes in ({"approved_sha256": "0" * 64}, {"report_max_bytes": 1}, {"packet_max_bytes": 0}):
+            with self.subTest(changes=changes):
+                result = self.run_batch(**changes)
+                self.assertNotEqual(result.outcome, "COMPLETED")
+                self.assertEqual(self.a_calls, [])
+                self.assertFalse((self.metadata / "batch-checkpoint.json").exists())
+
+    def test_checkpoint_capacity_is_reserved_before_any_task_runs(self):
+        template = self.plan["tasks"][0]
+        self.plan["tasks"] = [dict(template, task_id=f"task-{index}", order=index, depends_on=[])
+                              for index in range(1, 101)]
+        self.configure(100)
+        result = self.run_batch()
+        self.assertEqual(result.error_code, "BATCH_METADATA_TOO_LARGE", result)
+        self.assertEqual(self.a_calls, [])
+        self.assertFalse((self.metadata / "batch-checkpoint.json").exists())
+
+    def test_reused_session_stops_before_later_tests(self):
+        def implement(*args, **kwargs):
+            result = self.implement(*args, **kwargs)
+            return replace(result, session_id=self.session(1, 0))
+        result = self.run_batch(implement=implement)
+        self.assertEqual(result.error_code, "BATCH_SESSION_REUSED", result)
+        self.assertEqual((len(self.a_calls), len(self.test_calls)), (2, 1))
+
+    def test_existing_task_metadata_prevents_all_execution(self):
+        (self.metadata / "task-0002").mkdir()
+        result = self.run_batch()
+        self.assertEqual(result.error_code, "METADATA_DESTINATION_EXISTS")
+        self.assertEqual(self.a_calls, [])
+        self.assertFalse((self.metadata / "batch-checkpoint.json").exists())
+
+    def test_cli_runs_real_three_task_pipeline_and_returns_completed(self):
+        from contextlib import redirect_stdout, redirect_stderr
+        import io
+        from auto_coding.cli import main
+        output, errors = io.StringIO(), io.StringIO()
+        with patch("auto_coding.orchestrator.run_implementation", side_effect=self.implement), \
+             patch("auto_coding.orchestrator.run_approved_tests", side_effect=self.run_tests_fake), \
+             patch("auto_coding.orchestrator.run_review_packet", side_effect=self.review), \
+             redirect_stdout(output), redirect_stderr(errors):
+            status = main(["run", str(self.frozen_path), "--approved-sha256", self.approval,
+                           "--repository", str(self.repository), "--metadata-directory", str(self.metadata),
+                           "--repository-id", "example/sequential", "--git-timeout-seconds", "5",
+                           "--evidence-max-bytes", "100000", "--packet-max-bytes", "200000", "--report-max-bytes", "200000"])
+        self.assertEqual(status, 0, output.getvalue() + errors.getvalue())
+        self.assertIn("COMPLETED", output.getvalue())
+        self.assertIn("Completed tasks: 3/3", output.getvalue())
+        self.assertEqual(self.checkpoint()["status"], "completed")
+
+
 if __name__ == "__main__":
     unittest.main()

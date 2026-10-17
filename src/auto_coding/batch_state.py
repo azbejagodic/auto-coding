@@ -41,6 +41,8 @@ def _matches(value: object, pattern: re.Pattern) -> bool:
 
 
 def _validate(data: object) -> dict:
+    if isinstance(data, dict) and type(data.get("schema_version")) is int and data["schema_version"] == 2:
+        return _validate_sequential(data)
     if not isinstance(data, dict) or data.keys() != _FIELDS:
         raise CheckpointError("checkpoint fields are invalid")
     if type(data["schema_version"]) is not int or data["schema_version"] != 1:
@@ -99,6 +101,64 @@ def _validate(data: object) -> dict:
     elif stage == "finished" or (stage == "pending") != (task is None):
         raise CheckpointError("inconsistent stopped checkpoint")
     return dict(data)
+
+
+def _validate_sequential(data):
+    """A batch ledger; immutable session histories stay in v1 task checkpoints.
+
+The original batch base never advances. Publication entries form an append-only
+chain of controller-verified publications, without implying crash recovery.
+"""
+    if data.keys() != _FIELDS | {"task_ids", "publications", "current_head"}:
+        raise CheckpointError("invalid sequential checkpoint fields")
+    ids, entries = data["task_ids"], data["publications"]
+    if (not isinstance(ids, list) or not 1 <= len(ids) <= 100
+            or any(not _matches(value, _IDENTIFIER) for value in ids) or len(set(ids)) != len(ids)
+            or not isinstance(entries, list) or len(entries) > len(ids)):
+        raise CheckpointError("invalid sequential task list")
+    head = data["base_head"]
+    copied = []
+    for index, entry in enumerate(entries):
+        if (not isinstance(entry, dict) or entry.keys() != {"task_id", "starting_head", "commit_sha", "remote_sha", "finalized"}
+                or entry["task_id"] != ids[index] or entry["starting_head"] != head
+                or not _matches(entry["commit_sha"], _HEAD) or entry["remote_sha"] != entry["commit_sha"]
+                or type(entry["finalized"]) is not bool or (index < len(entries) - 1 and not entry["finalized"])):
+            raise CheckpointError("invalid verified publication chain")
+        head = entry["commit_sha"]
+        copied.append(dict(entry))
+    if data["current_head"] != head or any(data[name] is not None for name in _SESSIONS):
+        raise CheckpointError("invalid sequential execution state")
+    status = data["status"]
+    finished = sum(entry["finalized"] for entry in entries)
+    if ((data["stage"] == "pending" and entries)
+            or (entries and not entries[-1]["finalized"] and status != "stopped")):
+        raise CheckpointError("invalid sequential terminal state")
+    if status in ("running", "stopped") and data["stage"] != "pending":
+        if finished == len(ids) or data["current_task_id"] != ids[finished]:
+            raise CheckpointError("invalid current sequential task")
+    if (status == "pending" and entries) or (status == "completed" and finished != len(ids)):
+        raise CheckpointError("invalid sequential completion")
+    # Reuse every v1 scalar/stage check without relaxing its contract.
+    scalar = {name: data[name] for name in _FIELDS}
+    scalar["schema_version"] = 1
+    _validate(scalar)
+    return dict(data, task_ids=list(ids), publications=copied)
+
+
+def validate_checkpoint_capacity(state: object) -> None:
+    """Reserve existing byte limits before execution; never write forecast data."""
+    data = _validate(state)
+    if data["schema_version"] == 2:
+        head = data["base_head"]
+        reserved = []
+        for task_id in data["task_ids"]:
+            reserved.append(dict(task_id=task_id, starting_head=head, commit_sha="0" * 40,
+                                 remote_sha="0" * 40, finalized=False))
+            head = "0" * 40
+        data = dict(data, publications=reserved, current_head=head, status="completed",
+                    current_task_id=max(data["task_ids"], key=len), stage="implementation", stop_reason_code="A" * 64)
+    if len(json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")) > _MAX_BYTES:
+        raise CheckpointError("checkpoint capacity exceeds metadata size limit")
 
 
 def _unique_fields(pairs: list[tuple[str, object]]) -> dict:
@@ -176,10 +236,19 @@ not proof produced by storage. It is required to enter completed status.
         raise CheckpointError("completion verification must be boolean")
     data = _validate(state)
     previous = load_checkpoint(destination)
+    if data["schema_version"] != previous["schema_version"]:
+        raise CheckpointError("checkpoint version cannot change")
     if any(data[f] != previous[f] for f in _IMMUTABLE):
         raise CheckpointError("batch identity cannot change")
     if any(previous[f] is not None and data[f] != previous[f] for f in _SESSIONS):
         raise CheckpointError("established session cannot change")
+    if data["schema_version"] == 2:
+        before, after = previous["publications"], data["publications"]
+        if (data["task_ids"] != previous["task_ids"] or len(after) not in (len(before), len(before) + 1)
+                or after[:len(before)] != before):
+            raise CheckpointError("verified publication history cannot change")
+        if previous["status"] == "stopped" and data != previous:
+            raise CheckpointError("stopped sequential batch cannot resume")
     if previous["status"] == "completed" and data != previous:
         raise CheckpointError("completed checkpoint cannot resume")
     if previous["status"] != "pending" and data["status"] == "pending":

@@ -15,7 +15,7 @@ from auto_coding.plan_preflight import preflight_frozen_plan
 from auto_coding.plans import PlanValidationError, validate_plan
 from auto_coding.orchestrator import (
     FirstTaskReviewResult, SingleTaskPublishResult, execute_first_task_through_review,
-    export_stopped_batch_report, publish_single_task_batch,
+    export_stopped_batch_report, publish_single_task_batch, execute_sequential_batch, SequentialBatchResult,
 )
 
 
@@ -28,8 +28,8 @@ _EXAMPLES = r'''PowerShell examples (also available through the installed auto-c
 Review the COMPLETE plan before supplying its confirmed fingerprint to freeze.
 Validation is not approval. An explicit fingerprint argument is a caller
 assertion; matching it does not independently authenticate a human.
-Plan commands do not execute a batch. Run executes and publishes one approved
-task. Preflight is a snapshot, not a lock. Run never resumes or retries.
+Plan commands do not execute a batch. Run executes and publishes approved tasks
+sequentially. Preflight is a snapshot, not a lock. Run never resumes or retries.
 '''
 
 
@@ -138,8 +138,37 @@ def _run(args) -> int:
         plan = load_frozen_plan(frozen, args.approved_sha256)
         if plan["schema_version"] != 2:
             raise _CliFailure("PLAN_SCHEMA_NOT_RUNNABLE")
-        if len(plan["tasks"]) != 1:
-            raise _CliFailure("SINGLE_TASK_BATCH_REQUIRED")
+        if len(plan["tasks"]) > 1:
+            phase = "execution"
+            print("SEQUENTIAL IMPLEMENTATION / TESTS / REVIEW / PUBLICATION")
+            result = execute_sequential_batch(
+                frozen, args.approved_sha256, repository, metadata, args.repository_id,
+                args.git_timeout_seconds, args.evidence_max_bytes, args.packet_max_bytes, args.report_max_bytes)
+            if not isinstance(result, SequentialBatchResult):
+                raise _CliFailure("BATCH_RESULT_UNCERTAIN")
+            complete = (result.outcome == "COMPLETED" and result.error_code is None
+                        and result.checkpoint_error_code is None and result.report_error_code is None
+                        and result.completed_task_ids == tuple(task["task_id"] for task in plan["tasks"])
+                        and tuple(item[0] for item in result.publications) == result.completed_task_ids
+                        and all(re.fullmatch(r"[0-9a-fA-F]{40}", item[1]) and item[1] == item[2] for item in result.publications)
+                        and result.report_paths == (metadata / "batch-report.json", metadata / "batch-report.md"))
+            if complete:
+                print("COMPLETED")
+            else:
+                status = ("PUBLISHED_NOT_FINALIZED" if result.outcome == "PUBLISHED_NOT_FINALIZED"
+                          else "PARTIALLY_COMPLETED" if result.publications else "STOPPED")
+                safe_stage = result.stage if result.stage in {"preflight", "implementation", "evidence", "testing", "review", "staging", "publishing", "checkpoint", "reporting"} else "execution"
+                print(f"{status} stage={safe_stage} reason={_safe_code(result.error_code, 'BATCH_UNVERIFIED')}", file=sys.stderr)
+            print("Batch: " + json.dumps(plan["batch_id"]))
+            print(f"Completed tasks: {len(result.completed_task_ids)}/{len(plan['tasks'])}")
+            for task_id, commit, remote in result.publications:
+                if re.fullmatch(r"[0-9a-fA-F]{40}", commit) and re.fullmatch(r"[0-9a-fA-F]{40}", remote):
+                    print("Task: " + json.dumps(task_id) + f"; Commit SHA: {commit}; Remote SHA: {remote}")
+            for label, code in (("Checkpoint", result.checkpoint_error_code), ("Reporting", result.report_error_code)):
+                if code is not None:
+                    print(label + ": " + _safe_code(code, "FINALIZATION_FAILED"), file=sys.stderr)
+            _show_paths(checkpoint, metadata, result)
+            return 0 if complete else 1
         phase = "implementation"
         print("IMPLEMENTATION / TESTS / REVIEW")
         handoff = execute_first_task_through_review(
@@ -278,7 +307,7 @@ def _summary(plan: dict, fingerprint: str) -> None:
 
 def _parser() -> argparse.ArgumentParser:
     parser = _Parser(
-        prog="auto-coding", description="Auto-Coding v1: approved plans and single-task execution",
+        prog="auto-coding", description="Auto-Coding v1: approved plans and sequential task execution",
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=_EXAMPLES,
     )
     commands = parser.add_subparsers(dest="command")
@@ -300,7 +329,7 @@ def _parser() -> argparse.ArgumentParser:
     preflight.add_argument("--approved-sha256", required=True, help="explicit approved fingerprint from an independent trusted source")
     preflight.add_argument("--repository", required=True, help="target Git working-tree root")
     preflight.add_argument("--git-timeout-seconds", required=True, type=_positive_timeout, help="positive finite timeout for each read-only Git command")
-    run = commands.add_parser("run", help="execute, review and publish exactly one approved frozen task")
+    run = commands.add_parser("run", help="execute, review and publish approved frozen tasks in order")
     run.add_argument("frozen_plan_path", help="approved schema-v2 frozen artifact outside the target repository")
     run.add_argument("--approved-sha256", required=True, type=_approval, help="explicit trusted approval fingerprint; never inferred")
     run.add_argument("--repository", required=True, help="target Git working-tree root")

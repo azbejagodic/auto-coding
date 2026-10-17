@@ -445,6 +445,16 @@ Operational events use the logger's fields, with absent optional keys set to Non
     stopped = sum(t["status"] == "stopped" for t in tasks)
     if checkpoint["status"] == "completed":
         _require(completed == len(tasks))
+    sequential = checkpoint["schema_version"] == 2
+    if sequential:
+        _require([task["task_id"] for task in tasks] == checkpoint["task_ids"])
+        entries = checkpoint["publications"]
+        for entry, task in zip(entries, tasks):
+            _require(task["status"] == ("completed" if entry["finalized"] else "stopped")
+                     and task["publishing"] is not None and task["publishing"]["outcome"] == "PUBLISHED")
+            _require(task["publishing"]["commit_sha"] == entry["commit_sha"]
+                     and task["publishing"]["remote_sha"] == entry["remote_sha"])
+        _require(completed == sum(entry["finalized"] for entry in entries))
     current = checkpoint["current_task_id"]
     if current is not None:
         matching = [t for t in tasks if t["task_id"] == current]
@@ -453,8 +463,9 @@ Operational events use the logger's fields, with absent optional keys set to Non
         if task["status"] == "stopped":
             _require(task["failure_stage"] == checkpoint["stage"]
                      and task["stop_reason_code"] == checkpoint["stop_reason_code"])
-        for field, role in (("implementer_session_id", "implementer"), ("reviewer_session_id", "reviewer")):
-            _require(checkpoint[field] == task[role]["session_id"])
+        if not sequential:
+            for field, role in (("implementer_session_id", "implementer"), ("reviewer_session_id", "reviewer")):
+                _require(checkpoint[field] == task[role]["session_id"])
     identifiers = {t["task_id"] for t in tasks}
     for event in events:
         _require(event["batch_id"] in (None, checkpoint["batch_id"]))

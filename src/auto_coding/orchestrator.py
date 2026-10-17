@@ -1,4 +1,4 @@
-"""Review a first frozen task, then separately publish a single-task batch.
+"""Execute approved tasks sequentially through independent review and publication.
 
 The supplied approval fingerprint is a trusted caller assertion. Checks observe
 snapshots, not locks or containment; live Codex sandbox enforcement is a separate
@@ -16,7 +16,7 @@ import re
 import stat
 import uuid
 
-from auto_coding.batch_state import CheckpointError, create_checkpoint, load_checkpoint, update_checkpoint
+from auto_coding.batch_state import CheckpointError, create_checkpoint, load_checkpoint, update_checkpoint, validate_checkpoint_capacity
 from auto_coding.batch_report import BatchReportError, ReportExportError, build_batch_report, export_batch_report
 from auto_coding.change_evidence import (
     ChangeEvidence, _external_temporary_directory, _safe_location, collect_change_evidence,
@@ -27,8 +27,8 @@ from auto_coding.git_publish import (
 )
 from auto_coding.integrations.codex import ImplementationOutcome, ImplementationReport, run_implementation
 from auto_coding.plan_freeze import PlanIntegrityError, load_frozen_plan, plan_fingerprint
-from auto_coding.plan_preflight import preflight_frozen_plan
-from auto_coding.review import ReviewResult, _evidence_fingerprint, build_review_packet, run_review_packet
+from auto_coding.plan_preflight import preflight_frozen_plan, _preflight_verified_plan
+from auto_coding.review import ReviewResult, _evidence_fingerprint, _packet_json_size, build_review_packet, run_review_packet
 from auto_coding.test_runner import TestRunResult, _command_identity, run_approved_tests
 
 
@@ -164,6 +164,28 @@ def execute_first_task_through_review(
     checkpoint_path: str | Path, git_timeout_seconds: float,
     evidence_max_bytes: int, packet_max_bytes: int,
 ) -> FirstTaskReviewResult:
+    """Review only the first task, retaining the original single-task interface."""
+    return _execute_task_through_review(
+        frozen_plan_path, approved_sha256, repository_directory, checkpoint_path,
+        git_timeout_seconds, evidence_max_bytes, packet_max_bytes)
+
+
+def _task_preflight(frozen, approval, repository, timeout, position):
+    if position is None:
+        return preflight_frozen_plan(frozen, approval, repository, timeout)
+    try:
+        plan = load_frozen_plan(frozen, approval)
+    except (PlanIntegrityError, OSError):
+        raise _Stop("PLAN_INVALID_OR_UNAPPROVED") from None
+    if plan["schema_version"] != 2 or plan_fingerprint(plan) != approval:
+        raise _Stop("PLAN_INVALID_OR_UNAPPROVED")
+    return _preflight_verified_plan(plan, approval, repository, timeout, position[1])
+
+
+def _execute_task_through_review(
+    frozen_plan_path, approved_sha256, repository_directory, checkpoint_path,
+    git_timeout_seconds, evidence_max_bytes, packet_max_bytes, *, position=None, prior_sessions=(),
+) -> FirstTaskReviewResult:
     """Return an in-memory handoff for D16b; never stage, publish or complete.
 
 All execution settings come exclusively from the approved schema-v2 plan.
@@ -196,7 +218,7 @@ all further execution and is never retried. Ignored files follow Git semantics.
     try:
         if any(type(limit) is not int or limit <= 0 for limit in (evidence_max_bytes, packet_max_bytes)):
             raise _Stop("INVALID_MAX_BYTES")
-        preflight = preflight_frozen_plan(frozen_plan_path, approved_sha256, repository_directory, git_timeout_seconds)
+        preflight = _task_preflight(frozen_plan_path, approved_sha256, repository_directory, git_timeout_seconds, position)
         if not preflight.ready:
             raise _Stop(_code(preflight.error_code, "PREFLIGHT_FAILED"))
         try:
@@ -207,9 +229,13 @@ all further execution and is never retried. Ignored files follow Git semantics.
             raise _Stop("PLAN_IO_FAILED") from None
         if plan["schema_version"] != 2 or plan_fingerprint(plan) != approved_sha256:
             raise _Stop("PLAN_INVALID_OR_UNAPPROVED")
-        task = plan["tasks"][0]
-        if task["order"] != 1:
+        index = 0 if position is None else position[0]
+        starting_head = plan["expected_head"] if position is None else position[1]
+        task = plan["tasks"][index]
+        if task["order"] != index + 1:
             raise _Stop("FIRST_TASK_INVALID")
+        git_state = {"expected_branch": plan["expected_branch"], "expected_head": starting_head,
+                     "expected_origin_url": plan["expected_origin_url"]}
         repository = Path(repository_directory).resolve(strict=True)
         requested_destination = Path(checkpoint_path)
         if os.path.lexists(requested_destination):
@@ -219,10 +245,10 @@ all further execution and is never retried. Ignored files follow Git semantics.
             raise _Stop("UNSAFE_CHECKPOINT_LOCATION")
         values.update(batch_id=plan["batch_id"], task_id=task["task_id"], plan_sha256=approved_sha256,
                       repository_directory=repository, checkpoint_path=destination,
-                      expected_branch=plan["expected_branch"], expected_head=plan["expected_head"],
+                      expected_branch=plan["expected_branch"], expected_head=starting_head,
                       expected_origin_url=plan["expected_origin_url"], permitted_files=tuple(task["permitted_files"]))
         state = {"schema_version": 1, "batch_id": plan["batch_id"], "frozen_plan_sha256": approved_sha256,
-                 "expected_branch": plan["expected_branch"], "base_head": plan["expected_head"],
+                 "expected_branch": plan["expected_branch"], "base_head": starting_head,
                  "status": "pending", "current_task_id": None, "stage": "pending",
                  "implementer_session_id": None, "reviewer_session_id": None, "stop_reason_code": None}
         try:
@@ -233,7 +259,7 @@ all further execution and is never retried. Ignored files follow Git semantics.
             raise _Stop("CHECKPOINT_CREATE_FAILED") from None
         created = True
         # Recheck critical starting state immediately before the first invocation.
-        preflight = preflight_frozen_plan(frozen_plan_path, approved_sha256, repository, git_timeout_seconds)
+        preflight = _task_preflight(frozen_plan_path, approved_sha256, repository, git_timeout_seconds, position)
         if not preflight.ready:
             raise _Stop(_code(preflight.error_code, "PREFLIGHT_FAILED"))
         prompt = task["review"]["prompt"]
@@ -249,6 +275,8 @@ all further execution and is never retried. Ignored files follow Git semantics.
         if isinstance(implementation, ImplementationOutcome) and _session(implementation.session_id):
             values["implementer_session_id"] = implementation.session_id
             persist(implementer_session_id=implementation.session_id)
+            if implementation.session_id.lower() in prior_sessions:
+                raise _Stop("BATCH_SESSION_REUSED")
         if (not isinstance(implementation, ImplementationOutcome) or implementation.succeeded is not True
                 or type(implementation.exit_status) is not int or implementation.exit_status != 0
                 or implementation.timed_out is not False or implementation.cleanup_result != "not_needed"
@@ -258,12 +286,12 @@ all further execution and is never retried. Ignored files follow Git semantics.
                 or not math.isfinite(implementation.elapsed_seconds) or implementation.elapsed_seconds < 0):
             raise _Stop(_code(getattr(implementation, "error_code", None), "IMPLEMENTATION_INVALID"))
         phase = "evidence"
-        values["evidence"] = _snapshot(repository, plan, task, git_timeout_seconds, evidence_max_bytes)
+        values["evidence"] = _snapshot(repository, git_state, task, git_timeout_seconds, evidence_max_bytes)
         phase = "testing"
         persist(stage="testing")
         tests = run_approved_tests(repository, task["test_commands"], task["limits"]["test_seconds"])
         values["terminal_results"] = tests
-        evidence = _snapshot(repository, plan, task, git_timeout_seconds, evidence_max_bytes)
+        evidence = _snapshot(repository, git_state, task, git_timeout_seconds, evidence_max_bytes)
         values["evidence"] = evidence
         if not isinstance(tests, TestRunResult) or tests.passed is not True:
             if isinstance(tests, TestRunResult) and isinstance(tests.command_results, tuple):
@@ -272,8 +300,8 @@ all further execution and is never retried. Ignored files follow Git semantics.
                 if any(getattr(result, "cleanup_result", None) != "not_needed" for result in tests.command_results):
                     raise _Stop("TEST_CLEANUP_UNCERTAIN")
             raise _Stop("TESTS_NOT_PASSED")
-        context = _context(repository, plan, evidence, git_timeout_seconds, evidence_max_bytes)
-        if _snapshot(repository, plan, task, git_timeout_seconds, evidence_max_bytes) != evidence:
+        context = _context(repository, git_state, evidence, git_timeout_seconds, evidence_max_bytes)
+        if _snapshot(repository, git_state, task, git_timeout_seconds, evidence_max_bytes) != evidence:
             raise _Stop("EVIDENCE_CHANGED")
         phase = "review"
         persist(stage="review")
@@ -294,12 +322,14 @@ all further execution and is never retried. Ignored files follow Git semantics.
             if review.session_id.lower() == implementation.session_id.lower():
                 raise _Stop("REVIEW_SESSION_NOT_INDEPENDENT")
             persist(reviewer_session_id=review.session_id)
+            if review.session_id.lower() in prior_sessions:
+                raise _Stop("BATCH_SESSION_REUSED")
         if not isinstance(review, ReviewResult) or review.approved is not True:
             raise _Stop(_code(getattr(review, "error_code", None), "REVIEW_NOT_APPROVED"))
         if _review_snapshot(packet, review, packet_max_bytes) != evidence:
             raise _Stop("REVIEW_BINDING_MISMATCH")
-        if (_snapshot(repository, plan, task, git_timeout_seconds, evidence_max_bytes) != evidence
-                or _context(repository, plan, evidence, git_timeout_seconds, evidence_max_bytes) != context):
+        if (_snapshot(repository, git_state, task, git_timeout_seconds, evidence_max_bytes) != evidence
+                or _context(repository, git_state, evidence, git_timeout_seconds, evidence_max_bytes) != context):
             raise _Stop("EVIDENCE_CHANGED_AFTER_REVIEW")
         phase = "publishing"
         persist(stage="publishing")
@@ -349,15 +379,16 @@ def _sha(value):
     return isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{40}", value) is not None
 
 
-def _publication_handoff(handoff, plan, approved_sha256, evidence_limit, packet_limit):
+def _publication_handoff(handoff, plan, approved_sha256, evidence_limit, packet_limit, *, position=None):
     """Bind the entire retained packet and result metadata to the frozen task."""
-    task = plan["tasks"][0]
+    task = plan["tasks"][0 if position is None else position[0]]
+    starting_head = plan["expected_head"] if position is None else position[1]
     if (not isinstance(handoff, FirstTaskReviewResult) or handoff.outcome != "READY_FOR_PUBLICATION"
             or handoff.stage != "publishing" or handoff.error_code is not None
             or handoff.checkpoint_error_code is not None or handoff.implementation_started is not True
             or handoff.review_started is not True or handoff.batch_id != plan["batch_id"]
             or handoff.task_id != task["task_id"] or handoff.plan_sha256 != approved_sha256
-            or handoff.expected_branch != plan["expected_branch"] or handoff.expected_head != plan["expected_head"]
+            or handoff.expected_branch != plan["expected_branch"] or handoff.expected_head != starting_head
             or handoff.expected_origin_url != plan["expected_origin_url"]
             or handoff.permitted_files != tuple(task["permitted_files"])
             or not _session(handoff.implementer_session_id) or not _session(handoff.reviewer_session_id)
@@ -539,6 +570,16 @@ def publish_single_task_batch(
     git_timeout_seconds: float, evidence_max_bytes: int, packet_max_bytes: int, report_max_bytes: int,
     metadata_directory: str | Path, repository_identifier: str,
 ) -> SingleTaskPublishResult:
+    """Publish and finalize an approved one-task batch without retries."""
+    return _publish_task(handoff, frozen_plan_path, approved_sha256, git_timeout_seconds,
+                         evidence_max_bytes, packet_max_bytes, report_max_bytes,
+                         metadata_directory, repository_identifier)
+
+
+def _publish_task(
+    handoff, frozen_plan_path, approved_sha256, git_timeout_seconds, evidence_max_bytes,
+    packet_max_bytes, report_max_bytes, metadata_directory, repository_identifier, *, position=None,
+) -> SingleTaskPublishResult:
     """Complete one approved task using only D13 mutations and D14 finalization.
 
 Commit message policy: 'auto-coding: <frozen-task-id>'. No execution settings
@@ -584,12 +625,14 @@ be unavailable. Reporting failure never changes verified publication truth.
             raise _Stop("PLAN_INVALID_OR_UNAPPROVED") from None
         if plan["schema_version"] != 2 or plan_fingerprint(plan) != approved_sha256:
             raise _Stop("PLAN_INVALID_OR_UNAPPROVED")
-        if len(plan["tasks"]) != 1:
+        if position is None and len(plan["tasks"]) != 1:
             raise _Stop("SINGLE_TASK_BATCH_REQUIRED")
-        task = plan["tasks"][0]
-        if task["order"] != 1:
+        index = 0 if position is None else position[0]
+        starting_head = plan["expected_head"] if position is None else position[1]
+        task = plan["tasks"][index]
+        if task["order"] != index + 1:
             raise _Stop("FIRST_TASK_INVALID")
-        _publication_handoff(handoff, plan, approved_sha256, evidence_max_bytes, packet_max_bytes)
+        _publication_handoff(handoff, plan, approved_sha256, evidence_max_bytes, packet_max_bytes, position=position)
         repository = Path(handoff.repository_directory).resolve(strict=True)
         if repository != handoff.repository_directory:
             raise _Stop("HANDOFF_REPOSITORY_INVALID")
@@ -601,7 +644,7 @@ be unavailable. Reporting failure never changes verified publication truth.
         except (OSError, CheckpointError):
             raise _Stop("CHECKPOINT_INVALID") from None
         expected = {"schema_version": 1, "batch_id": plan["batch_id"], "frozen_plan_sha256": approved_sha256,
-                    "expected_branch": plan["expected_branch"], "base_head": plan["expected_head"],
+                    "expected_branch": plan["expected_branch"], "base_head": starting_head,
                     "status": "running", "current_task_id": task["task_id"], "stage": "publishing",
                     "implementer_session_id": handoff.implementer_session_id, "reviewer_session_id": handoff.reviewer_session_id,
                     "stop_reason_code": None}
@@ -623,7 +666,7 @@ be unavailable. Reporting failure never changes verified publication truth.
         persist(stage="staging")
         values["staging_invoked"] = True
         outcome = "STAGING_FAILED_OR_UNCERTAIN"
-        staged = stage_reviewed_changes(repository, plan["expected_branch"], plan["expected_head"],
+        staged = stage_reviewed_changes(repository, plan["expected_branch"], starting_head,
                                         plan["expected_origin_url"], git_timeout_seconds, task["permitted_files"],
                                         handoff.reviewed_packet, handoff.review, max(evidence_max_bytes, packet_max_bytes))
         values["staging"] = staged if isinstance(staged, GitStageResult) else None
@@ -638,7 +681,7 @@ be unavailable. Reporting failure never changes verified publication truth.
         persist(stage="publishing")
         values["publishing_invoked"] = True
         outcome = "PUBLICATION_AMBIGUOUS"
-        publishing = publish_reviewed_changes(repository, plan["expected_branch"], plan["expected_head"],
+        publishing = publish_reviewed_changes(repository, plan["expected_branch"], starting_head,
                                              plan["expected_origin_url"], git_timeout_seconds, staged,
                                              handoff.reviewed_packet, handoff.review, max(evidence_max_bytes, packet_max_bytes),
                                              f"auto-coding: {task['task_id']}")
@@ -712,3 +755,241 @@ be unavailable. Reporting failure never changes verified publication truth.
     if reason is None and values.get("report_error_code") is not None:
         reason = values["report_error_code"]
     return SingleTaskPublishResult(outcome, phase, reason, **values)
+
+
+@dataclass(frozen=True)
+class SequentialBatchResult:
+    outcome: str
+    stage: str
+    error_code: str | None = None
+    checkpoint_error_code: str | None = None
+    report_error_code: str | None = None
+    completed_task_ids: tuple[str, ...] = ()
+    # Verified publications include a task whose later metadata finalization failed.
+    publications: tuple[tuple[str, str, str], ...] = ()
+    current_task_id: str | None = None
+    checkpoint_path: Path | None = field(default=None, repr=False)
+    report_paths: tuple[Path, ...] = field(default=(), repr=False)
+    partial_report_paths: tuple[Path, ...] = field(default=(), repr=False)
+
+
+def _pending_task_record(task):
+    return _report_task(FirstTaskReviewResult("NOT_STARTED", "pending"), task,
+                        {"status": "stopped", "stage": "pending", "stop_reason_code": None},
+                        None, None, False, record_unattempted=False)
+
+
+def _check_report_history(records, limit):
+    if _packet_json_size(records, limit) > limit:
+        raise _Stop("REPORT_HISTORY_TOO_LARGE")
+
+
+def execute_sequential_batch(
+    frozen_plan_path, approved_sha256, repository_directory, metadata_directory,
+    repository_identifier, git_timeout_seconds, evidence_max_bytes, packet_max_bytes, report_max_bytes,
+) -> SequentialBatchResult:
+    """Execute one approved plan in order, stopping on the first uncertain result.
+
+The v2 batch checkpoint retains the original approved base and a verified SHA
+chain. Each task has an ordinary v1 checkpoint and reports in task-NNNN/. Fresh
+A/B sessions and the original frozen file are used throughout; no derived plans,
+resume, retry or repair are performed. All resource limits remain in force.
+"""
+    phase, reason = "preflight", None
+    state = path = directory = repository = None
+    created = storage_failed = False
+    records, completed, publications = [], [], []
+    paths = partial_paths = ()
+    checkpoint_error = report_error = None
+    current = None
+    handoff = published = None
+    sessions = set()
+    execution_invoked = False
+
+    def persist(candidate, *, complete=False):
+        nonlocal state, storage_failed
+        try:
+            if load_checkpoint(path) != state:
+                raise CheckpointError("batch checkpoint changed")
+            update_checkpoint(path, candidate, completion_verified=complete)
+            if load_checkpoint(path) != candidate:
+                raise CheckpointError("batch checkpoint write not verified")
+        except (OSError, CheckpointError, KeyboardInterrupt):
+            storage_failed = True
+            raise _CheckpointFailure from None
+        state = candidate
+
+    try:
+        if any(type(limit) is not int or limit <= 0 for limit in (evidence_max_bytes, packet_max_bytes, report_max_bytes)):
+            raise _Stop("INVALID_MAX_BYTES")
+        preflight = preflight_frozen_plan(frozen_plan_path, approved_sha256, repository_directory, git_timeout_seconds)
+        if preflight.ready is not True or preflight.error_code is not None:
+            raise _Stop(_code(preflight.error_code, "PREFLIGHT_FAILED"))
+        plan = load_frozen_plan(frozen_plan_path, approved_sha256)
+        if plan["schema_version"] != 2 or plan_fingerprint(plan) != approved_sha256:
+            raise _Stop("PLAN_INVALID_OR_UNAPPROVED")
+        repository = Path(repository_directory).resolve(strict=True)
+        frozen = Path(frozen_plan_path).resolve(strict=True)
+        if frozen.is_relative_to(repository) or Path(frozen_plan_path).absolute().is_relative_to(repository):
+            raise _Stop("UNSAFE_FROZEN_PLAN_LOCATION")
+        requested = Path(metadata_directory).absolute()
+        directory = requested.resolve(strict=True)
+        if (requested != directory or ".." in requested.parts or not directory.is_dir()
+                or directory.is_relative_to(repository)):
+            raise _Stop("UNSAFE_METADATA_DIRECTORY")
+        for component in (*directory.parents, directory):
+            info = component.lstat()
+            if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0):
+                raise _Stop("UNSAFE_METADATA_DIRECTORY")
+        if (not isinstance(repository_identifier, str) or len(repository_identifier) > 256
+                or not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", repository_identifier)):
+            raise _Stop("REPORT_REPOSITORY_IDENTIFIER_INVALID")
+        path = directory / "batch-checkpoint.json"
+        tasks = plan["tasks"]
+        if len(tasks) > 100:  # Existing report schema limit; never truncate a plan.
+            raise _Stop("BATCH_METADATA_TOO_LARGE")
+        for target in (path, directory / "batch-report.json", directory / "batch-report.md",
+                       *(directory / f"task-{i:04d}" for i in range(1, len(tasks) + 1))):
+            if os.path.lexists(target):
+                raise _Stop("METADATA_DESTINATION_EXISTS")
+        state = dict(schema_version=2, batch_id=plan["batch_id"], frozen_plan_sha256=approved_sha256,
+                     expected_branch=plan["expected_branch"], base_head=plan["expected_head"], status="pending",
+                     current_task_id=None, stage="pending", implementer_session_id=None, reviewer_session_id=None,
+                     stop_reason_code=None, task_ids=[task["task_id"] for task in tasks], publications=[],
+                     current_head=plan["expected_head"])
+        try:
+            validate_checkpoint_capacity(state)
+        except CheckpointError:
+            raise _Stop("BATCH_METADATA_TOO_LARGE") from None
+        for task in tasks:
+            record = _pending_task_record(task)
+            _check_report_history(record, report_max_bytes)
+            records.append(record)
+            _check_report_history(records, report_max_bytes)
+        # Validate representability before Codex or checkpoint creation. This is
+        # a capacity check, never an exported or stored execution observation.
+        metadata = {"repository_id": repository_identifier, "started_at": None, "ended_at": None}
+        build_batch_report(dict(state, status="stopped", stop_reason_code="CAPACITY_CHECK"),
+                           metadata, records, [], report_max_bytes)
+        create_checkpoint(path, state)
+        created = True
+        for index, task in enumerate(tasks):
+            handoff = published = None
+            execution_invoked = False
+            current, phase = task["task_id"], "implementation"
+            starting_head = state["current_head"]
+            persist(dict(state, status="running", current_task_id=current, stage="implementation"))
+            child = directory / f"task-{index + 1:04d}"
+            child.mkdir()  # No overwrite and no automatic reuse of task artifacts.
+            execution_invoked = True
+            handoff = _execute_task_through_review(
+                frozen_plan_path, approved_sha256, repository, child / "batch-checkpoint.json",
+                git_timeout_seconds, evidence_max_bytes, packet_max_bytes, position=(index, starting_head),
+                prior_sessions=sessions)
+            if (handoff.outcome != "READY_FOR_PUBLICATION" or handoff.error_code is not None
+                    or handoff.checkpoint_error_code is not None):
+                phase = handoff.stage
+                raise _Stop(_code(handoff.error_code, "REVIEW_HANDOFF_INVALID"))
+            phase = "publishing"
+            published = _publish_task(
+                handoff, frozen_plan_path, approved_sha256, git_timeout_seconds, evidence_max_bytes,
+                packet_max_bytes, report_max_bytes, child, repository_identifier, position=(index, starting_head))
+            if not isinstance(published, SingleTaskPublishResult):
+                raise _Stop("PUBLICATION_UNVERIFIED")
+            observed = published.publishing
+            if published.published is True and (
+                    not isinstance(observed, GitPublishResult) or observed.outcome != "PUBLISHED"
+                    or observed.error_code is not None or observed.commit_attempted is not True
+                    or observed.push_attempted is not True or not _sha(observed.commit_sha)
+                    or observed.commit_sha != observed.remote_sha or observed.observed_head_sha != observed.commit_sha
+                    or observed.commit_sha != published.commit_sha or observed.remote_sha != published.remote_sha):
+                raise _Stop("PUBLICATION_UNVERIFIED")
+            finalized = (published.outcome == "PUBLISHED_FINALIZED" and published.error_code is None
+                         and published.checkpoint_error_code is None and published.report_error_code is None
+                         and published.published is True and published.checkpoint_finalized is True
+                         and published.reports_exported is True and published.staging_invoked is True
+                         and published.publishing_invoked is True
+                         and published.report_paths == (child / "batch-report.json", child / "batch-report.md"))
+            entries = state["publications"]
+            if published.published is True:
+                if not _sha(published.commit_sha) or published.commit_sha != published.remote_sha:
+                    raise _Stop("PUBLICATION_UNVERIFIED")
+                publications.append((current, published.commit_sha, published.remote_sha))
+                entries = [*entries, dict(task_id=current, starting_head=starting_head,
+                                         commit_sha=published.commit_sha, remote_sha=published.remote_sha,
+                                         finalized=finalized)]
+            if not finalized:
+                phase = published.stage
+                # Keep verified publication truth even when later metadata failed.
+                candidate = dict(state, publications=entries,
+                                 current_head=entries[-1]["commit_sha"] if entries else state["base_head"],
+                                 status="stopped", stage=phase if phase in {"staging", "publishing"} else "publishing",
+                                 stop_reason_code=_code(published.error_code, "PUBLICATION_UNVERIFIED"))
+                persist(candidate)
+                raise _Stop(candidate["stop_reason_code"])
+            completed.append(current)
+            sessions.update((handoff.implementer_session_id.lower(), handoff.reviewer_session_id.lower()))
+            last = index == len(tasks) - 1
+            persist(dict(state, publications=entries, current_head=published.commit_sha,
+                         status="completed" if last else "running", stage="finished" if last else "implementation",
+                         current_task_id=None if last else tasks[index + 1]["task_id"]), complete=last)
+            terminal = load_checkpoint(handoff.checkpoint_path)
+            if terminal["status"] != "completed":
+                raise _Stop("TASK_CHECKPOINT_CHANGED")
+            records[index] = _report_task(handoff, task, terminal, published.staging, published.publishing, True)
+            _check_report_history(records, report_max_bytes)
+        current, phase = None, "reporting"
+    except _CheckpointFailure:
+        reason = checkpoint_error = "BATCH_CHECKPOINT_WRITE_FAILED"
+    except (Exception, KeyboardInterrupt) as error:
+        reason = _code(str(error), "BATCH_EXECUTION_FAILED") if isinstance(error, _Stop) else (
+            "BATCH_INTERRUPTED_STATE_UNCERTAIN" if isinstance(error, KeyboardInterrupt) else "BATCH_EXECUTION_FAILED")
+    if reason is not None and created and not storage_failed and state["status"] != "completed":
+        # A terminal checkpoint is written once. Failed writes are never retried.
+        if state["status"] != "stopped":
+            stage = phase if phase in {"implementation", "testing", "review", "staging", "publishing"} else state["stage"]
+            try:
+                persist(dict(state, status="stopped", stage=stage, stop_reason_code=reason))
+            except _CheckpointFailure:
+                checkpoint_error = "BATCH_CHECKPOINT_WRITE_FAILED"
+        try:
+            index = state["task_ids"].index(state["current_task_id"])
+            current = state["current_task_id"]
+            task = tasks[index]
+            # Preflight can return known no-start observations before assigning
+            # task identity. Preserve them rather than marking execution unknown.
+            stopped_before_identity = (
+                handoff is not None and handoff.task_id is None
+                and handoff.outcome == "STOPPED_BEFORE_IMPLEMENTATION"
+                and handoff.implementation_started is False and handoff.review_started is False)
+            observation = handoff if handoff is not None and (
+                handoff.task_id == task["task_id"] or stopped_before_identity) else FirstTaskReviewResult(
+                "NO_RESULT", phase, implementation_started=None if execution_invoked else False,
+                review_started=None if execution_invoked else False)
+            task_publication = published if observation is handoff else None
+            records[index] = _report_task(observation, task, state,
+                                           None if task_publication is None else task_publication.staging,
+                                           None if task_publication is None else task_publication.publishing,
+                                           False if task_publication is None else task_publication.publishing_invoked,
+                                           record_unattempted=False)
+        except (ValueError, AttributeError, TypeError):
+            if state["current_task_id"] is not None:
+                report_error = "REPORT_OBSERVATIONS_UNAVAILABLE"
+    if created:
+        try:
+            terminal = load_checkpoint(path)
+            if storage_failed or terminal != state or terminal["status"] not in {"stopped", "completed"}:
+                raise _Stop("REPORT_CHECKPOINT_NOT_TERMINAL")
+            if report_error is not None:
+                raise _Stop(report_error)
+            paths = export_batch_report(terminal, metadata, records, [], report_max_bytes,
+                                        destination=directory, repository_directory=repository)
+        except ReportExportError as error:
+            report_error, partial_paths = "REPORT_EXPORT_FAILED", tuple(error.partial_paths[:4])
+        except (Exception, KeyboardInterrupt) as error:
+            report_error = _code(str(error), "REPORT_UNAVAILABLE") if isinstance(error, _Stop) else "REPORT_UNAVAILABLE"
+    reason = reason or report_error
+    outcome = ("COMPLETED" if reason is None else "PUBLISHED_NOT_FINALIZED"
+               if state is not None and state["status"] == "completed" else "PARTIALLY_COMPLETED" if publications else "STOPPED")
+    return SequentialBatchResult(outcome, phase, reason, checkpoint_error, report_error,
+                                 tuple(completed), tuple(publications), current, path, paths, partial_paths)

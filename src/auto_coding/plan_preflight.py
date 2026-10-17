@@ -64,8 +64,19 @@ before execution and publishing. No hash alone proves human authorization.
         return PlanPreflightResult(False, "PLAN_IO_FAILED")
     if plan["schema_version"] != 2:
         return PlanPreflightResult(False, "PLAN_SCHEMA_NOT_RUNNABLE")
+    return _preflight_verified_plan(plan, approved_sha256, repository_directory,
+                                    git_timeout_seconds, plan["expected_head"])
+
+
+def _preflight_verified_plan(plan, approved_sha256, repository_directory,
+                             git_timeout_seconds, starting_head):
+    """Internal controller check at a previously verified task boundary.
+
+The caller must first validate the original frozen plan and derive starting_head
+from the preceding verified publication. This never changes the approved plan.
+"""
     git_state = check_publish_preflight(
-        repository_directory, plan["expected_branch"], plan["expected_head"],
+        repository_directory, plan["expected_branch"], starting_head,
         plan["expected_origin_url"], git_timeout_seconds,
     )
     if not git_state.passed:
@@ -91,8 +102,8 @@ before execution and publishing. No hash alone proves human authorization.
         if output:
             return PlanPreflightResult(False, "WORKTREE_NOT_CLEAN")
         return PlanPreflightResult(
-            True, batch_id=plan["batch_id"], plan_sha256=canonical_fingerprint,
-            branch=plan["expected_branch"], starting_head=plan["expected_head"].lower(),
+            True, batch_id=plan["batch_id"], plan_sha256=approved_sha256,
+            branch=plan["expected_branch"], starting_head=starting_head.lower(),
             repository_directory=repository, origin_url=plan["expected_origin_url"],
             test_timeouts=tuple((task["task_id"], task["limits"]["test_seconds"]) for task in plan["tasks"]),
         )

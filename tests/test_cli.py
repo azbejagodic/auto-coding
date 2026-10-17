@@ -499,18 +499,49 @@ class RunCliTests(unittest.TestCase):
         self.assertIn("WORKTREE_NOT_CLEAN", result[2])
         self.assertEqual((self.repository / "app.txt").read_bytes(), b"pre-existing user change")
 
-    def test_multi_task_and_v1_plans_stop_before_execution(self):
+    def test_v1_plan_stops_before_execution(self):
         from test_plans import make_plan
-        for version in (2, 1):
-            if version == 2:
-                second = deepcopy(self.plan["tasks"][0])
-                second.update(task_id="task-2", order=2, depends_on=["task-1"])
-                self.plan["tasks"].append(second)
-            else:
-                self.plan = make_plan()
-            self.frozen_path.unlink()
-            self.refreeze()
-            self.assert_no_execution(self.invoke(self.changed_args(approved_sha256=self.approval)))
+        self.plan = make_plan()
+        self.frozen_path.unlink()
+        self.refreeze()
+        self.assert_no_execution(self.invoke(self.changed_args(approved_sha256=self.approval)))
+
+    def test_multi_task_plan_reaches_sequential_controller_with_exact_inputs(self):
+        from auto_coding.orchestrator import SequentialBatchResult
+        second = deepcopy(self.plan["tasks"][0])
+        second.update(task_id="task-2", order=2, depends_on=["task-1"])
+        self.plan["tasks"].append(second)
+        self.frozen_path.unlink()
+        self.refreeze()
+        with patch("auto_coding.cli.execute_sequential_batch", return_value=SequentialBatchResult(
+                "STOPPED", "implementation", "CODEX_FAILED")) as batch, \
+             patch("auto_coding.cli.execute_first_task_through_review") as single:
+            result = self.direct(self.changed_args(approved_sha256=self.approval))
+        self.assertEqual(result[0], 1)
+        self.assertIn("CODEX_FAILED", result[2])
+        single.assert_not_called()
+        batch.assert_called_once_with(self.frozen_path, self.approval, self.repository, self.metadata,
+                                      "example/disposable", 5.0, 100000, 200000, 200000)
+
+    def test_sequential_report_failure_preserves_all_publication_shas_and_nonzero_status(self):
+        from auto_coding.orchestrator import SequentialBatchResult
+        second = deepcopy(self.plan["tasks"][0])
+        second.update(task_id="task-2", order=2, depends_on=["task-1"])
+        self.plan["tasks"].append(second)
+        self.frozen_path.unlink()
+        self.refreeze()
+        publication = SequentialBatchResult("PUBLISHED_NOT_FINALIZED", "reporting", "REPORT_UNAVAILABLE",
+                        report_error_code="REPORT_UNAVAILABLE", completed_task_ids=("task-1", "task-2"),
+                        publications=(("task-1", "a" * 40, "a" * 40), ("task-2", "b" * 40, "b" * 40)))
+        with patch("auto_coding.cli.execute_sequential_batch", return_value=publication) as batch:
+            result = self.direct(self.changed_args(approved_sha256=self.approval))
+        self.assertEqual(result[0], 1)
+        self.assertIn("PUBLISHED_NOT_FINALIZED", result[2])
+        self.assertIn("Completed tasks: 2/2", result[1])
+        self.assertIn("Commit SHA: " + "b" * 40, result[1])
+        self.assertIn("Remote SHA: " + "b" * 40, result[1])
+        self.assertNotIn("\nCOMPLETED\n", result[1])
+        batch.assert_called_once()
 
     def test_metadata_inside_target_and_missing_or_non_directory_rejected(self):
         inside = self.repository / "metadata"

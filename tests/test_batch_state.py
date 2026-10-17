@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from auto_coding.batch_state import (
-    CheckpointError, create_checkpoint, load_checkpoint, update_checkpoint,
+    CheckpointError, create_checkpoint, load_checkpoint, update_checkpoint, validate_checkpoint_capacity,
 )
 
 
@@ -331,6 +331,74 @@ class BatchStateTests(unittest.TestCase):
         update_checkpoint(self.path, self.running())
         load_checkpoint(self.path)
         self.assertEqual(snapshot(), before)
+
+
+class SequentialCheckpointTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.path = Path(temporary.name) / "checkpoint.json"
+        self.initial = dict(initial_state(), schema_version=2, task_ids=["task-1", "task-2"],
+                            publications=[], current_head="b" * 40)
+
+    def first_completed(self):
+        entry = dict(task_id="task-1", starting_head="b" * 40, commit_sha="c" * 40,
+                     remote_sha="c" * 40, finalized=True)
+        return dict(self.initial, status="running", stage="implementation", current_task_id="task-2",
+                    publications=[entry], current_head="c" * 40)
+
+    def test_verified_chain_is_persisted_without_changing_original_base(self):
+        validate_checkpoint_capacity(self.initial)
+        create_checkpoint(self.path, self.initial)
+        first = self.first_completed()
+        update_checkpoint(self.path, first)
+        final = dict(first, status="completed", stage="finished", current_task_id=None,
+                     current_head="d" * 40, publications=[*first["publications"],
+                     dict(task_id="task-2", starting_head="c" * 40, commit_sha="d" * 40,
+                          remote_sha="d" * 40, finalized=True)])
+        with self.assertRaises(CheckpointError):
+            update_checkpoint(self.path, final)
+        update_checkpoint(self.path, final, completion_verified=True)
+        self.assertEqual(load_checkpoint(self.path), final)
+        self.assertEqual(final["base_head"], self.initial["base_head"])
+
+    def test_malformed_chain_or_scope_and_history_rewrites_fail_closed(self):
+        create_checkpoint(self.path, self.initial)
+        first = self.first_completed()
+        update_checkpoint(self.path, first)
+        before = self.path.read_bytes()
+        invalid = [dict(first, publications=[], current_head="b" * 40, current_task_id="task-1"),
+                   dict(first, base_head="a" * 40), dict(first, current_head="a" * 40),
+                   dict(first, task_ids=["task-1", "other"]), dict(first, current_task_id="task-1"),
+                   dict(first, implementer_session_id=_A), dict(first, schema_version=1)]
+        for changes in ({"starting_head": "0" * 40}, {"remote_sha": "0" * 40},
+                        {"task_id": "task-2"}, {"finalized": 1}, {"extra": "field"}):
+            invalid.append(dict(first, publications=[dict(first["publications"][0], **changes)]))
+        for candidate in invalid:
+            with self.subTest(candidate=candidate), self.assertRaises(CheckpointError):
+                update_checkpoint(self.path, candidate)
+            self.assertEqual(self.path.read_bytes(), before)
+
+    def test_verified_push_with_failed_finalization_is_durable_and_cannot_resume(self):
+        create_checkpoint(self.path, self.initial)
+        first = self.first_completed()
+        first.update(status="stopped", current_task_id="task-1", stage="publishing",
+                     stop_reason_code="REPORT_UNAVAILABLE",
+                     publications=[dict(first["publications"][0], finalized=False)])
+        update_checkpoint(self.path, first)
+        self.assertEqual(load_checkpoint(self.path), first)
+        with self.assertRaises(CheckpointError):
+            update_checkpoint(self.path, dict(first, status="running", stop_reason_code=None))
+
+    def test_capacity_reservation_rejects_large_ledger_without_writes(self):
+        large = dict(self.initial, task_ids=[f"task-{index:04d}-" + "a" * 50 for index in range(100)])
+        with self.assertRaises(CheckpointError):
+            validate_checkpoint_capacity(large)
+        self.assertFalse(self.path.exists())
+        for task_ids in ([], ["task-1", "task-1"], ["bad/id"], ["task-1"] * 101):
+            with self.subTest(task_ids=task_ids), self.assertRaises(CheckpointError):
+                create_checkpoint(self.path, dict(self.initial, task_ids=task_ids))
+        self.assertFalse(self.path.exists())
 
 
 if __name__ == "__main__":
